@@ -1,0 +1,12 @@
+{
+  "name": "VELQRA Botanical Beauty & Skincare",
+  "short_name": "VELQRA",
+  "description": "Premium botanical skincare and beauty products.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0B3C5D",
+  "categories": ["shopping", "ecommerce"],
+  "lang": "en",
+  "dir": "ltr"
+}

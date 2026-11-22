@@ -1,0 +1,19 @@
+# Environment files (keep safe templates)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies and generated output
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+**/build/
+backend/uploads/
+
+# Logs and local files
+*.log
+.DS_Store
+*.env
+!.env.example

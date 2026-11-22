@@ -1,0 +1,7695 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { Routes, Route, useNavigate, Link, useLocation, useParams, Navigate } from 'react-router-dom';
+import axios from 'axios';
+import { Country, State } from 'country-state-city';
+import { downloadOrderInvoice } from './services/api';
+import { captureTrafficAttribution, getTrafficAttribution } from './lib/trafficAttribution';
+import { API_BASE, BACKEND_ORIGIN } from './config/app';
+import {
+  CURRENCY_OPTIONS,
+  LANGUAGE_OPTIONS,
+  LocalizationContext,
+  formatCurrency as formatMoney,
+  translate,
+  useLocalization
+} from './i18n/localization';
+import LocaleControls from './i18n/LocaleControls';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
+import ProductReviewsModal, { getDemoReviewSummary, ReviewStars } from './components/ProductReviewsModal';
+import velqraLogo from './assets/velqra-logo.png';
+
+// =============================================
+// API URLs - SECURE (Environment Variables)
+// =============================================
+const API_URL = API_BASE;
+const AUTH_URL = `${API_URL}/auth`;
+const COUNTRIES = Country.getAllCountries().sort((left, right) => left.name.localeCompare(right.name));
+const DEFAULT_COUNTRY = COUNTRIES.find(country => country.isoCode === 'IN') || COUNTRIES[0];
+const PRODUCTS_CACHE_KEY = 'velqra_products_cache';
+const EXCHANGE_RATES_CACHE_KEY = 'velqra_exchange_rates';
+const ADMIN_SETUP_CACHE_KEY = 'velqra_admin_setup_complete';
+const EXCHANGE_RATE_API_URL = 'https://api.frankfurter.dev/v2/rates';
+const isValidGmailAddress = (value) => {
+  const normalizedEmail = String(value || '').trim().toLowerCase();
+  const [localPart, domain, ...extraParts] = normalizedEmail.split('@');
+  if (!localPart || domain !== 'gmail.com' || extraParts.length > 0 ||
+      localPart.length > 64 || normalizedEmail.length > 254) return false;
+
+  const [username, alias, ...extraAliases] = localPart.split('+');
+  const isValidPart = (part, maxLength) => Boolean(part) &&
+    part.length <= maxLength &&
+    /^[a-z0-9.]+$/.test(part) &&
+    !part.startsWith('.') &&
+    !part.endsWith('.') &&
+    !part.includes('..');
+
+  return extraAliases.length === 0 &&
+    isValidPart(username, 30) &&
+    (alias === undefined || isValidPart(alias, 64));
+};
+const getCachedExchangeRates = () => {
+  try {
+    const cached = JSON.parse(localStorage.getItem(EXCHANGE_RATES_CACHE_KEY) || '{}');
+    const rates = cached.rates && typeof cached.rates === 'object' ? cached.rates : {};
+    return {
+      rates: { INR: 1, ...rates },
+      date: typeof cached.date === 'string' ? cached.date : ''
+    };
+  } catch {
+    return { rates: { INR: 1 }, date: '' };
+  }
+};
+const getPayUPaymentUrl = (value) => {
+  const paymentUrl = new URL(String(value));
+  if (paymentUrl.protocol !== 'https:' ||
+      !['secure.payu.in', 'test.payu.in'].includes(paymentUrl.hostname)) {
+    throw new Error('Invalid payment gateway URL');
+  }
+  return paymentUrl.href;
+};
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, character => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+})[character]);
+const isVerifiedOnlineOrder = (order) =>
+  order?.paymentMethod === 'online' &&
+  Array.isArray(order.statusHistory) &&
+  order.statusHistory.some(entry =>
+    entry?.status === 'Payment Verified' && entry?.updatedBy === 'PayU'
+  );
+const getShippingLabelHtml = (order) => {
+  const delivery = order.delivery || {};
+  const addressLines = [
+    delivery.address,
+    delivery.landmark,
+    [delivery.city, delivery.state].filter(Boolean).join(', '),
+    delivery.pincode,
+    delivery.country
+  ].filter(Boolean);
+  const items = (order.items || []).map(item =>
+    `<li><span>${escapeHtml(item.name || 'Product')}</span><strong>×${escapeHtml(item.qty || 1)}</strong></li>`
+  ).join('');
+
+  return `<!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>VELQRA shipping label</title>
+        <style>
+          @page { size: 4in 6in; margin: 0.18in; }
+          * { box-sizing: border-box; }
+          body { margin: 0; color: #17211d; font: 14px Arial, sans-serif; }
+          .label { min-height: 5.64in; border: 1px solid #263d32; padding: 14px; }
+          header { display: flex; align-items: center; gap: 12px; padding-bottom: 10px; border-bottom: 2px solid #173b32; }
+          .logo { width: 58px; height: 52px; object-fit: contain; }
+          .brand { color: #173b32; font-size: 19px; font-weight: 800; letter-spacing: 2px; }
+          .brand small { display: block; margin-top: 3px; color: #58665f; font-size: 9px; letter-spacing: 1px; }
+          .section { margin-top: 15px; }
+          .eyebrow { color: #53645b; font-size: 9px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; }
+          .name { margin: 5px 0; font-size: 21px; font-weight: 800; overflow-wrap: anywhere; }
+          .phone { font-size: 18px; font-weight: 700; }
+          .address { margin-top: 5px; font-size: 15px; line-height: 1.45; overflow-wrap: anywhere; }
+          .order { display: flex; justify-content: space-between; gap: 8px; border-top: 1px dashed #829087; border-bottom: 1px dashed #829087; margin-top: 14px; padding: 9px 0; font-size: 10px; }
+          ul { margin: 9px 0 0; padding: 0; list-style: none; }
+          li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; font-size: 11px; }
+          li span { overflow-wrap: anywhere; }
+          .paid { margin-top: 8px; color: #166534; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+          @media screen { body { width: 4in; padding: 12px; background: #e5e7eb; } .label { background: white; } }
+        </style>
+      </head>
+      <body>
+        <main class="label">
+          <header>
+            <img class="logo" src="${escapeHtml(new URL(velqraLogo, window.location.href).href)}" alt="VELQRA logo">
+            <div class="brand">VELQRA<small>DELIVERY LABEL</small></div>
+          </header>
+          <section class="section">
+            <div class="eyebrow">Ship to</div>
+            <div class="name">${escapeHtml(delivery.fullName || 'Customer')}</div>
+            <div class="phone">${escapeHtml(delivery.phone || '')}</div>
+            <div class="address">${addressLines.map(escapeHtml).join('<br>')}</div>
+            ${delivery.alternatePhone ? `<div class="address">Alternate: ${escapeHtml(delivery.alternatePhone)}</div>` : ''}
+          </section>
+          <div class="order">
+            <span>ORDER #${escapeHtml(String(order._id || order.id || '').slice(-8).toUpperCase())}</span>
+            <span>ONLINE · PAID</span>
+          </div>
+          <ul>${items}</ul>
+          <div class="paid">Payment verified by PayU</div>
+        </main>
+      </body>
+    </html>`;
+};
+const requireLoginResponse = (data) => {
+  if (!data || typeof data !== 'object' || data.success !== true ||
+      typeof data.token !== 'string' || !data.token ||
+      !data.user || typeof data.user !== 'object') {
+    throw new Error(data?.message || 'The server returned an empty or invalid login response.');
+  }
+  return data;
+};
+
+const getCachedProducts = () => {
+  try {
+    const cached = localStorage.getItem(PRODUCTS_CACHE_KEY);
+    const products = cached ? JSON.parse(cached) : [];
+    return Array.isArray(products) ? products : [];
+  } catch {
+    return [];
+  }
+};
+
+const getSessionUser = () => {
+  try {
+    const saved = sessionStorage.getItem('velqra_user');
+    return saved ? JSON.parse(saved) : null;
+  } catch {
+    sessionStorage.removeItem('velqra_user');
+    return null;
+  }
+};
+
+const getRegisteredPhone = (user) =>
+  String(user?.phone || user?.phoneNumber || '').replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '').slice(-10);
+const getCountryCallingCode = country => String(country?.phonecode || '').replace(/\D/g, '');
+const formatInternationalPhone = (nationalNumber, country) => {
+  const callingCode = getCountryCallingCode(country);
+  const nationalDigits = String(nationalNumber || '').replace(/\D/g, '').replace(/^0+/, '');
+  const fullNumber = `${callingCode}${nationalDigits}`;
+  return callingCode && fullNumber.length >= 7 && fullNumber.length <= 15
+    ? `+${fullNumber}`
+    : '';
+};
+
+const normalizeCart = (items = []) => items.map(item => ({
+  ...item,
+  _id: item._id || item.productId || item.product_id,
+  originalPrice: item.originalPrice ?? item.original_price ?? 0,
+  image: item.image || item.imageUrl || item.image_url || '',
+  selectedAttributes: item.selectedAttributes || item.selected_attributes || {},
+  promoCode: item.promoCode || item.promo_code || '',
+  promoApplied: item.promoApplied ?? item.promo_applied ?? Boolean(item.promoCode || item.promo_code)
+}));
+
+const getCartItemKey = (item) => JSON.stringify([
+  String(item._id || item.productId || item.product_id || item.id || ''),
+  Object.fromEntries(
+    Object.entries(item.selectedAttributes || item.selected_attributes || {}).sort(([a], [b]) => a.localeCompare(b))
+  ),
+  String(item.promoApplied || item.promo_applied ? item.promoCode || item.promo_code || '' : '').trim().toUpperCase()
+]);
+
+const normalizeProduct = (product) => {
+  const rawStock = product.stock;
+  const stock = rawStock === undefined || rawStock === null || rawStock === ''
+    ? 10
+    : Number(rawStock);
+
+  return {
+    ...product,
+    _id: product._id || product.id,
+    stock: Number.isSafeInteger(stock) && stock >= 0 ? stock : 0,
+    rating: Number(product.rating ?? 0),
+    reviewsCount: Number(product.reviewsCount ?? product.reviews_count ?? 0),
+    originalPrice: Number(product.originalPrice ?? product.original_price ?? product.price ?? 0),
+    discountPercent: Number(product.discountPercent ?? product.discount_percent ?? 0),
+    price: Number(
+      product.price ??
+      Number(product.original_price ?? product.originalPrice ?? 0) *
+        (1 - Number(product.discountPercent ?? product.discount_percent ?? 0) / 100)
+    ),
+    promoCode: product.promoCode || product.promo_code || '',
+    promoDiscount: Number(product.promoDiscount ?? product.promo_discount ?? 0),
+    imageUrl: product.imageUrl || product.image_url || '',
+    videoUrl: product.videoUrl || product.video_url || '',
+    videoType: product.videoType || product.video_type || 'youtube'
+  };
+};
+
+const getSearchableProductText = (product) => {
+  const attributes = Object.entries(product?.attributes || {}).flatMap(([key, value]) => [
+    key,
+    ...(Array.isArray(value) ? value : [value])
+  ]);
+  return [
+    product?.name,
+    product?.category,
+    product?.brand,
+    ...attributes
+  ].filter(value => typeof value === 'string' || typeof value === 'number').join(' ').toLowerCase();
+};
+
+const getProductMetadataText = (value) => {
+  if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
+  if (Array.isArray(value)) {
+    return value.map(getProductMetadataText).filter(Boolean).join('\n');
+  }
+  if (value && typeof value === 'object') {
+    return [value.name || value.title, value.description || value.detail || value.value]
+      .filter(item => typeof item === 'string' || typeof item === 'number')
+      .join(': ')
+      .trim();
+  }
+  return '';
+};
+
+const getProductMetadata = (product, keys) => {
+  for (const key of keys) {
+    const text = getProductMetadataText(product?.[key]);
+    if (text) return text;
+  }
+  return '';
+};
+
+const getEditDistance = (left, right) => {
+  const previousRow = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const currentRow = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      currentRow[rightIndex] = Math.min(
+        currentRow[rightIndex - 1] + 1,
+        previousRow[rightIndex] + 1,
+        previousRow[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
+      );
+    }
+    for (let index = 0; index < previousRow.length; index += 1) previousRow[index] = currentRow[index];
+  }
+  return previousRow[right.length];
+};
+
+const getProductSearchScore = (product, searchQuery) => {
+  const query = searchQuery.trim().toLowerCase();
+  if (!query) return 0;
+
+  const searchableText = getSearchableProductText(product);
+  if (searchableText.includes(query) ||
+      searchableText.replace(/\s+/g, '').includes(query.replace(/\s+/g, ''))) return 0;
+
+  const queryWords = query.split(/\s+/).filter(Boolean);
+  const productWords = searchableText.split(/\s+/).filter(Boolean);
+  const candidates = queryWords.map(queryWord => productWords.flatMap((productWord, index) => {
+    if (queryWord.length < 3 || productWord.length < 3) {
+      return queryWord === productWord ? [{ index, distance: 0 }] : [];
+    }
+    const distance = getEditDistance(queryWord, productWord);
+    return distance <= 2 ? [{ index, distance }] : [];
+  })).sort((left, right) => left.length - right.length);
+
+  if (candidates.some(matches => matches.length === 0)) return Infinity;
+
+  let bestScore = Infinity;
+  const assignWords = (wordIndex, usedWords, edits) => {
+    if (edits > 2 || edits >= bestScore) return;
+    if (wordIndex === candidates.length) {
+      bestScore = edits;
+      return;
+    }
+    for (const candidate of candidates[wordIndex]) {
+      if (usedWords.has(candidate.index)) continue;
+      usedWords.add(candidate.index);
+      assignWords(wordIndex + 1, usedWords, edits + candidate.distance);
+      usedWords.delete(candidate.index);
+    }
+  };
+  assignWords(0, new Set(), 0);
+  return bestScore;
+};
+
+const matchesProductSearch = (product, searchQuery) =>
+  getProductSearchScore(product, searchQuery) <= 2;
+
+const HeaderSearchForm = ({ searchQuery, onSearchChange, suggestions, onSubmit, formatPrice, t, autoFocus = false, className = '' }) => {
+  const [isFocused, setIsFocused] = useState(false);
+  const hasQuery = Boolean(searchQuery.trim());
+  const submitSearch = () => {
+    setIsFocused(false);
+    onSubmit();
+  };
+
+  return (
+    <form
+      role="search"
+      onSubmit={event => {
+        event.preventDefault();
+        submitSearch();
+      }}
+      className={`velqra-header-search flex items-center gap-2 ${className}`}
+    >
+      <div className="relative min-w-0 flex-1">
+        <div className="velqra-search-field flex h-11 min-w-0 items-center gap-3 rounded-full border px-4 transition focus-within:ring-2 focus-within:ring-[#2e473b]/15">
+          <svg aria-hidden="true" className="h-5 w-5 shrink-0 text-[#2e473b]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="10.8" cy="10.8" r="6.8" />
+            <path strokeLinecap="round" d="m16 16 4.5 4.5" />
+          </svg>
+          <input
+            autoFocus={autoFocus}
+            type="search"
+            value={searchQuery}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submitSearch();
+              }
+            }}
+            onFocus={() => setIsFocused(true)}
+            onBlur={() => window.setTimeout(() => setIsFocused(false), 120)}
+            onChange={event => onSearchChange(event.target.value)}
+            placeholder={t('Search products, brands, categories...')}
+            aria-label={t('Search products, brands, categories...')}
+            aria-autocomplete="list"
+            aria-expanded={isFocused && hasQuery}
+            className="h-full min-w-0 flex-1 border-0 bg-transparent text-sm text-[#1c241e] outline-none placeholder:text-[#858980]"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => onSearchChange('')}
+              aria-label="Clear search"
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-[#73786f] transition hover:bg-[#e8e9e3] hover:text-[#1c241e]"
+            >
+              <span aria-hidden="true" className="text-lg leading-none">×</span>
+            </button>
+          )}
+        </div>
+        {isFocused && hasQuery && (
+          <div
+            role="listbox"
+            className="velqra-search-suggestions absolute left-0 right-0 top-[calc(100%+0.5rem)] z-[80] overflow-hidden rounded-2xl border border-[#e3e0d8] bg-white py-2 shadow-xl"
+          >
+            {suggestions.length > 0 ? suggestions.map(product => (
+              <Link
+                key={product._id}
+                to={`/product/${product._id}`}
+                role="option"
+                aria-selected="false"
+                onClick={() => setIsFocused(false)}
+                className="flex items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-[#f4f4ef]"
+              >
+                <img
+                  src={getProductDisplayImage(product)}
+                  alt=""
+                  loading="lazy"
+                  className="velqra-search-suggestion-image"
+                />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-semibold text-[#1c241e]">{product.name}</span>
+                  <span className="mt-0.5 block truncate text-xs text-[#73786f]">{product.category || product.brand || ''}</span>
+                </span>
+                <span className="shrink-0 text-sm font-bold text-[#2e473b]">{formatPrice(product.price)}</span>
+              </Link>
+            )) : (
+              <p className="px-4 py-3 text-sm text-[#73786f]">{t('No products match your filters')}</p>
+            )}
+          </div>
+        )}
+      </div>
+    </form>
+  );
+};
+
+// =============================================
+// Helper Functions
+// =============================================
+const getProductDisplayImage = (product) => {
+  if (!product) return '';
+  
+  const imagePaths = [];
+  if (Array.isArray(product.images) && product.images.length > 0) {
+    imagePaths.push(...product.images);
+  }
+  if (product.image) imagePaths.push(product.image);
+  if (product.imageUrl || product.image_url) imagePaths.push(product.imageUrl || product.image_url);
+  if (product.img) imagePaths.push(product.img);
+  
+  const validPaths = imagePaths.filter(Boolean);
+  
+  if (validPaths.length > 0) {
+    return validPaths[0];
+  }
+  
+  const category = (product.category || 'Product').toString();
+  const label = (product.name || 'Product').toString();
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">
+      <rect width="400" height="300" rx="24" fill="#0B3C5D"/>
+      <rect x="24" y="24" width="352" height="252" rx="18" fill="rgba(255,255,255,0.12)"/>
+      <circle cx="300" cy="90" r="48" fill="#FF5722"/>
+      <text x="200" y="160" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="700">${label}</text>
+      <text x="200" y="205" text-anchor="middle" fill="rgba(255,255,255,0.8)" font-family="Arial, sans-serif" font-size="16">${category}</text>
+    </svg>
+  `;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+};
+
+const getProductVideoUrl = (product) => {
+  const videoUrl = String(product?.videoUrl || product?.video_url || '').trim();
+  return videoUrl.startsWith('/') ? `${BACKEND_ORIGIN}${videoUrl}` : videoUrl;
+};
+
+const HomeProductMedia = ({ product }) => {
+  const [isVideoActive, setIsVideoActive] = useState(false);
+  const [videoHasStarted, setVideoHasStarted] = useState(false);
+  const [playbackBlocked, setPlaybackBlocked] = useState(false);
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const imageRef = useRef(null);
+  const videoRef = useRef(null);
+  const videoActivationTimerRef = useRef(null);
+  const videoUrl = getProductVideoUrl(product);
+  const imageUrl = getProductDisplayImage(product);
+  const hasUploadedVideo = product.videoType === 'uploaded' && Boolean(videoUrl);
+
+  useEffect(() => () => {
+    if (videoActivationTimerRef.current !== null) {
+      window.clearTimeout(videoActivationTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    setImageLoaded(false);
+    if (imageRef.current?.complete && imageRef.current.naturalWidth > 0) setImageLoaded(true);
+  }, [product._id, imageUrl]);
+
+  const activateVideo = () => {
+    setVideoHasStarted(false);
+    setPlaybackBlocked(false);
+    if (videoActivationTimerRef.current !== null) {
+      window.clearTimeout(videoActivationTimerRef.current);
+    }
+    videoActivationTimerRef.current = window.setTimeout(() => {
+      videoActivationTimerRef.current = null;
+      setIsVideoActive(true);
+    }, 1000);
+  };
+
+  const deactivateVideo = () => {
+    if (videoActivationTimerRef.current !== null) {
+      window.clearTimeout(videoActivationTimerRef.current);
+      videoActivationTimerRef.current = null;
+    }
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      if (video.readyState > 0) video.currentTime = 0;
+    }
+    setVideoHasStarted(false);
+    setPlaybackBlocked(false);
+    setIsVideoActive(false);
+  };
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!isVideoActive || !video) return undefined;
+
+    let active = true;
+    const handlePlaybackError = error => {
+      if (!active || error?.name === 'AbortError') return;
+      if (video.error ||
+          video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA ||
+          video.networkState === HTMLMediaElement.NETWORK_LOADING) return;
+
+      console.error('Product card video playback failed:', error);
+      setPlaybackBlocked(true);
+    };
+
+    try {
+      Promise.resolve(video.play())
+        .then(() => {
+          if (active) setPlaybackBlocked(false);
+        })
+        .catch(handlePlaybackError);
+    } catch (error) {
+      handlePlaybackError(error);
+    }
+
+    return () => {
+      active = false;
+    };
+  }, [isVideoActive]);
+
+  return (
+    <div
+      className="velqra-product-card-assets relative"
+      onMouseEnter={() => {
+        if (window.matchMedia('(hover: hover)').matches && hasUploadedVideo) activateVideo();
+      }}
+      onMouseLeave={() => {
+        if (window.matchMedia('(hover: hover)').matches) deactivateVideo();
+      }}
+    >
+      {!imageLoaded && <div className="velqra-media-skeleton" aria-hidden="true" />}
+      <img
+        ref={imageRef}
+        src={imageUrl}
+        alt={product.name}
+        loading="lazy"
+        decoding="async"
+        onLoad={() => setImageLoaded(true)}
+        onError={() => setImageLoaded(true)}
+        className={`transition duration-500 group-hover:scale-[1.04] ${videoHasStarted ? 'opacity-0' : 'opacity-100'}`}
+      />
+      {hasUploadedVideo && (
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          autoPlay={isVideoActive}
+          muted
+          loop
+          playsInline
+          preload={isVideoActive ? 'auto' : 'none'}
+          aria-label={`${product.name} demo video`}
+          onPlaying={() => {
+            setVideoHasStarted(true);
+            setPlaybackBlocked(false);
+          }}
+          onWaiting={() => setPlaybackBlocked(false)}
+          onError={() => {
+            if (videoRef.current?.error) {
+              console.error('Product card video failed to load:', videoRef.current.error);
+            }
+          }}
+          className={`velqra-product-card-video absolute inset-0 transition-opacity duration-300 ${
+            videoHasStarted ? 'opacity-100' : 'opacity-0'
+          }`}
+        />
+      )}
+      {playbackBlocked && (
+        <span
+          role="status"
+          className="absolute inset-0 z-[1] flex items-center justify-center bg-black/55 px-3 text-center text-xs font-bold text-white"
+        >
+          Video could not autoplay. Open the product to play it.
+        </span>
+      )}
+    </div>
+  );
+};
+
+const ProductDetailVideo = ({ src, poster }) => {
+  const [playbackBlocked, setPlaybackBlocked] = useState(false);
+  const videoRef = useRef(null);
+
+  const playMutedVideo = () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.muted = true;
+    Promise.resolve(video.play())
+      .then(() => setPlaybackBlocked(false))
+      .catch(error => {
+        if (error?.name === 'AbortError') return;
+        if (video.error ||
+            video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA ||
+            video.networkState === HTMLMediaElement.NETWORK_LOADING) return;
+
+        console.error('Product detail video playback failed:', error);
+        setPlaybackBlocked(true);
+      });
+  };
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !('IntersectionObserver' in window)) return undefined;
+
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+        playMutedVideo();
+      } else {
+        video.pause();
+        if (video.readyState > 0) video.currentTime = 0;
+        setPlaybackBlocked(false);
+      }
+    }, { threshold: [0, 0.5] });
+
+    observer.observe(video);
+    return () => {
+      observer.disconnect();
+      video.pause();
+      if (video.readyState > 0) video.currentTime = 0;
+    };
+  }, [src]);
+
+  return (
+    <div className="relative h-full w-full" onClick={playMutedVideo}>
+      <video
+        ref={videoRef}
+        src={src}
+        muted
+        playsInline
+        preload="none"
+        poster={poster}
+        onWaiting={() => setPlaybackBlocked(false)}
+        onError={() => {
+          if (videoRef.current?.error) {
+            console.error('Product detail video failed to load:', videoRef.current.error);
+          }
+        }}
+        className="h-full w-full object-contain"
+      />
+      {playbackBlocked && (
+        <span
+          role="status"
+          className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/55 px-3 text-center text-xs font-bold text-white"
+        >
+          Video could not autoplay.
+        </span>
+      )}
+    </div>
+  );
+};
+
+const ProductDetailVideoEmbed = ({ src, title, videoType }) => {
+  const [isVisible, setIsVisible] = useState(false);
+  const embedRef = useRef(null);
+  const muteParameter = videoType === 'youtube' ? 'mute=1' : 'muted=1';
+  const embedUrl = `${src}${src.includes('?') ? '&' : '?'}autoplay=1&${muteParameter}&controls=0&playsinline=1`;
+
+  useEffect(() => {
+    const embed = embedRef.current;
+    if (!embed || !('IntersectionObserver' in window)) return undefined;
+
+    const observer = new IntersectionObserver(([entry]) => {
+      setIsVisible(entry.isIntersecting && entry.intersectionRatio >= 0.5);
+    }, { threshold: [0, 0.5] });
+
+    observer.observe(embed);
+    return () => observer.disconnect();
+  }, [src]);
+
+  return (
+    <div
+      ref={embedRef}
+      className="h-full w-full"
+      onClick={() => setIsVisible(true)}
+    >
+      {isVisible && (
+        <iframe
+          src={embedUrl}
+          title={title}
+          className="pointer-events-none h-full w-full"
+          allow="autoplay"
+        />
+      )}
+    </div>
+  );
+};
+
+// ✅ YouTube ID Extractor
+const getYouTubeId = (url) => {
+  if (!url) return null;
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([^#&?]*)/,
+    /youtube\.com\/shorts\/([^#&?]*)/
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match && match[1] && match[1].length === 11) {
+      return match[1];
+    }
+  }
+  return null;
+};
+
+const getVimeoId = (url) => {
+  if (!url) return null;
+  const regExp = /(?:vimeo\.com\/|player\.vimeo\.com\/video\/)(\d+)/;
+  const match = url.match(regExp);
+  return match ? match[1] : null;
+};
+
+
+// ═══════════════════════════════════════════════════
+// 🧪 TEST MODE BANNER
+// ═══════════════════════════════════════════════════
+const TestModeBanner = ({ otp }) => (
+  <div className="bg-amber-50 border-2 border-dashed border-amber-400 rounded-xl px-4 py-3 mb-4">
+    <div className="flex items-start gap-2">
+      <span className="text-lg flex-shrink-0">🧪</span>
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-black uppercase tracking-wide text-amber-700">Test Mode Active</p>
+        <p className="text-[11px] text-amber-600 mt-0.5 leading-tight">SMS is disabled for this number. OTP auto-filled for testing.</p>
+        {otp && (
+          <p className="mt-2 text-sm font-black text-amber-800 tracking-widest">
+            OTP: <span className="bg-amber-200 px-2 py-0.5 rounded">{otp}</span>
+          </p>
+        )}
+      </div>
+    </div>
+  </div>
+);
+
+// ═══════════════════════════════════════════════════
+// RETURN REQUEST MODAL (COD: OTP + bank; online: PayU transaction + form)
+// ═══════════════════════════════════════════════════
+const RETURN_REASONS = [
+  'Damaged product',
+  'Wrong item received',
+  'Product not as described',
+  'Quality issue',
+  'Size/fit issue',
+  'Changed my mind',
+  'Other'
+];
+
+const ReturnRequestModal = ({ isOpen, onClose, order, onSuccess }) => {
+  const { formatCurrency } = useLocalization();
+  const [step, setStep] = useState('otp');
+  const [otp, setOtp] = useState('');
+  const [devOtp, setDevOtp] = useState('');
+  const [returnToken, setReturnToken] = useState('');
+  const [transactionId, setTransactionId] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [timer, setTimer] = useState(0);
+  const [resendDisabled, setResendDisabled] = useState(false);
+
+  // Bank
+  const [bank, setBank] = useState({
+    accountHolderName: '', accountNumber: '', ifscCode: '', bankName: '', upiId: ''
+  });
+  const [bankError, setBankError] = useState('');
+
+  // Return form
+  const [selectedItems, setSelectedItems] = useState({});
+  const [reason, setReason] = useState('');
+  const [description, setDescription] = useState('');
+  const [submitError, setSubmitError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const token = sessionStorage.getItem('velqra_user_token');
+
+  useEffect(() => {
+    let interval;
+    if (timer > 0) {
+      interval = setInterval(() => setTimer(prev => prev - 1), 1000);
+    } else {
+      setResendDisabled(false);
+    }
+    return () => clearInterval(interval);
+  }, [timer]);
+
+  useEffect(() => {
+  if (isOpen) {
+    setStep(order?.paymentMethod === 'online' ? 'form' : 'otp');
+    setOtp('');
+    setDevOtp('');
+    setReturnToken('');
+    setTransactionId(order?.paymentMethod === 'online' ? order?.referenceId || '' : '');
+    setError('');
+    setSelectedItems({});
+    setReason('');
+    setDescription('');
+    setSubmitError('');
+    setBankError('');
+    setTimer(0);
+    // ❌ Auto-send hata diya — user khud "Send OTP" dabayega
+  }
+}, [isOpen, order?.paymentMethod]);
+
+  const startTimer = () => {
+    setTimer(60);
+    setResendDisabled(true);
+  };
+
+  if (!isOpen || !order) return null;
+
+  // ========== STEP 1: Send OTP ==========
+  const sendOtp = async () => {
+    setLoading(true);
+    setError('');
+    setDevOtp('');
+    try {
+      const res = await axios.post(
+        `${API_URL}/returns/send-otp`,
+        { orderId: order._id || order.id },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.data.success) {
+        setStep('otp-verify');
+        startTimer();
+        if (res.data.otp) {
+          setOtp(res.data.otp);
+          setDevOtp(res.data.otp);
+        }
+      } else {
+        setError(res.data.message || 'Failed to send OTP');
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to send OTP');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ========== STEP 2: Verify OTP ==========
+  const verifyOtp = async (e) => {
+    e.preventDefault();
+    if (otp.length !== 6) return setError('Enter 6-digit OTP');
+    setLoading(true);
+    setError('');
+    try {
+      const res = await axios.post(
+        `${API_URL}/returns/verify-otp`,
+        { orderId: order._id || order.id, otp: otp.trim() },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.data.success) {
+        setReturnToken(res.data.returnToken);
+
+        // Bank details check karo
+        const bankRes = await axios.get(`${API_URL}/bank-details`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (bankRes.data.bankDetails) {
+          setBank({
+            accountHolderName: bankRes.data.bankDetails.accountHolderName || '',
+            accountNumber: bankRes.data.bankDetails.accountNumber || '',
+            ifscCode: bankRes.data.bankDetails.ifscCode || '',
+            bankName: bankRes.data.bankDetails.bankName || '',
+            upiId: bankRes.data.bankDetails.upiId || ''
+          });
+          setStep('form');
+        } else {
+          setStep('bank');
+        }
+      } else {
+        setError(res.data.message || 'OTP verification failed');
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'OTP verification failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ========== STEP 3: Save Bank ==========
+  const saveBank = async (e) => {
+    e.preventDefault();
+    if (!bank.accountHolderName || !bank.accountNumber || !bank.ifscCode || !bank.bankName) {
+      return setBankError('All bank fields are required');
+    }
+    setBankError('');
+    setLoading(true);
+    try {
+      const res = await axios.post(
+        `${API_URL}/bank-details`,
+        bank,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.data.success) {
+        setStep('form');
+      } else {
+        setBankError(res.data.message || 'Failed to save bank details');
+      }
+    } catch (err) {
+      setBankError(err.response?.data?.message || 'Failed to save bank details');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ========== STEP 4: Submit Return ==========
+  const submitReturn = async () => {
+    const isOnlineOrder = order.paymentMethod === 'online';
+    const items = Object.entries(selectedItems)
+      .filter(([, qty]) => qty > 0)
+      .map(([productId, qty]) => ({ productId, qty }));
+
+    if (items.length === 0) return setSubmitError('Select at least one item');
+    if (!reason) return setSubmitError('Select a reason');
+    if (isOnlineOrder && !transactionId.trim()) {
+      return setSubmitError('Enter the PayU transaction ID for this order');
+    }
+
+    setSubmitting(true);
+    setSubmitError('');
+    try {
+      const res = await axios.post(
+        `${API_URL}/returns`,
+        {
+          orderId: order._id || order.id,
+          items,
+          reason,
+          description,
+          ...(isOnlineOrder ? { transactionId: transactionId.trim() } : { returnToken })
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.data.success) {
+        setStep('done');
+        if (onSuccess) onSuccess(res.data.returnRequest);
+      } else {
+        setSubmitError(res.data.message || 'Failed to submit return');
+      }
+    } catch (err) {
+      setSubmitError(err.response?.data?.message || 'Failed to submit return');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // Refund estimate
+  const refundAmount = Object.entries(selectedItems).reduce((sum, [pid, qty]) => {
+    const item = (order.items || []).find(i => (i.product_id || i._id || i.id) === pid);
+    return sum + ((item?.price || 0) * qty);
+  }, 0);
+
+  // Overlay render
+  return (
+    <div
+      className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-[60] flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-2xl max-w-lg w-full p-6 border border-slate-100 shadow-2xl relative max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          className="absolute top-4 right-4 text-slate-400 hover:text-black font-bold text-lg"
+        >
+          ✕
+        </button>
+
+        {/* STEP 1: OTP Sending */}
+        {step === 'otp' && (
+          <>
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">↩️</span>
+              <h3 className="text-lg font-black text-[#0B3C5D]">Return Request</h3>
+            </div>
+            <p className="text-[11px] text-slate-400 mb-4">
+              OTP bhejenge aapke registered mobile pe verify karne ke liye.
+            </p>
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                {error}
+              </div>
+            )}
+            <button
+              onClick={sendOtp}
+              disabled={loading}
+              className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] disabled:opacity-50"
+            >
+              {loading ? '⏳ Sending OTP...' : '📱 Send OTP'}
+            </button>
+          </>
+        )}
+
+        {/* STEP 2: Verify OTP */}
+        {step === 'otp-verify' && (
+          <>
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">📱</span>
+              <h3 className="text-lg font-black text-[#0B3C5D]">Verify OTP</h3>
+            </div>
+            <p className="text-[11px] text-slate-400 mb-4">
+              Enter 6-digit OTP sent to your registered mobile.
+            </p>
+            {devOtp && <TestModeBanner otp={devOtp} />}
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                {error}
+              </div>
+            )}
+            <form onSubmit={verifyOtp} className="space-y-4">
+              <input
+                type="text"
+                value={otp}
+                onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="Enter 6-digit OTP"
+                maxLength={6}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-3 rounded-xl text-sm text-center text-2xl font-bold tracking-widest focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-400">
+                  {timer > 0 ? `Resend in ${timer}s` : "Didn't receive OTP?"}
+                </span>
+                <button
+                  type="button"
+                  onClick={sendOtp}
+                  disabled={resendDisabled || loading}
+                  className="font-bold text-[#0B3C5D] hover:underline disabled:opacity-50"
+                >
+                  Resend OTP
+                </button>
+              </div>
+              <button
+                type="submit"
+                disabled={loading || otp.length < 6 || (isGuest && !challengeId)}
+                className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] disabled:opacity-50"
+              >
+                {loading ? '⏳ Verifying...' : '✅ Verify OTP'}
+              </button>
+            </form>
+          </>
+        )}
+
+        {/* STEP 3: Bank Details */}
+        {step === 'bank' && (
+          <>
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">🏦</span>
+              <h3 className="text-lg font-black text-[#0B3C5D]">Bank Details</h3>
+            </div>
+            <p className="text-[11px] text-slate-400 mb-4">
+              Refund isi account mein aayega. Ye details safe rahengi.
+            </p>
+            {bankError && (
+              <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                {bankError}
+              </div>
+            )}
+            <form onSubmit={saveBank} className="space-y-3">
+              <input
+                placeholder="Account Holder Name *"
+                value={bank.accountHolderName}
+                onChange={(e) => setBank({ ...bank, accountHolderName: e.target.value })}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <input
+                placeholder="Account Number * (9-18 digits)"
+                value={bank.accountNumber}
+                onChange={(e) => setBank({ ...bank, accountNumber: e.target.value.replace(/\D/g, '') })}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <input
+                placeholder="IFSC Code * (e.g., SBIN0001234)"
+                value={bank.ifscCode}
+                onChange={(e) => setBank({ ...bank, ifscCode: e.target.value.toUpperCase() })}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <input
+                placeholder="Bank Name *"
+                value={bank.bankName}
+                onChange={(e) => setBank({ ...bank, bankName: e.target.value })}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <input
+                placeholder="UPI ID (optional)"
+                value={bank.upiId}
+                onChange={(e) => setBank({ ...bank, upiId: e.target.value })}
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              />
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] disabled:opacity-50"
+              >
+                {loading ? '⏳ Saving...' : '💾 Save & Continue'}
+              </button>
+            </form>
+          </>
+        )}
+
+        {/* STEP 4: Return Form */}
+        {step === 'form' && (
+          <>
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">📦</span>
+              <h3 className="text-lg font-black text-[#0B3C5D]">Return Details</h3>
+            </div>
+            <p className="text-[11px] text-slate-400 mb-4">
+              Select items and reason for return.
+            </p>
+
+            {order.paymentMethod === 'online' && (
+              <div className="mb-4">
+                <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                  PayU Transaction ID *
+                </label>
+                <p className="mb-2 text-[10px] text-slate-500">
+                  Enter the transaction ID for this order. The refund, if approved, goes to the original payment method; no bank details are needed.
+                </p>
+                <p className="mb-2 break-all rounded-lg bg-slate-50 p-2 font-mono text-[10px] text-slate-600">
+                  Order transaction ID: {order.referenceId || 'Unavailable'}
+                </p>
+                <input
+                  type="text"
+                  value={transactionId}
+                  onChange={(e) => setTransactionId(e.target.value.trim())}
+                  placeholder="Enter PayU transaction ID"
+                  maxLength={64}
+                  className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                />
+              </div>
+            )}
+
+            {/* Item select */}
+            <div className="mb-4">
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-2">
+                Select Items *
+              </label>
+              <div className="space-y-2 max-h-48 overflow-y-auto border border-slate-100 rounded-xl p-2">
+                {(order.items || []).map((item) => {
+                  const pid = item.product_id || item._id || item.id;
+                  return (
+                    <div key={pid} className="flex items-center gap-2 bg-slate-50 p-2 rounded-lg">
+                      <input
+                        type="checkbox"
+                        checked={selectedItems[pid] > 0}
+                        onChange={(e) => {
+                          setSelectedItems(prev => ({
+                            ...prev,
+                            [pid]: e.target.checked ? 1 : 0
+                          }));
+                        }}
+                        className="w-4 h-4"
+                      />
+                      <img
+                        src={item.image || getProductDisplayImage(item)}
+                        alt=""
+                        loading="lazy"
+                        decoding="async"
+                        className="w-10 h-10 rounded object-cover border"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="font-bold text-xs text-slate-800 truncate">{item.name}</div>
+                        <div className="text-[10px] text-slate-500">{formatCurrency(item.price)} × max {item.qty}</div>
+                      </div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={item.qty}
+                        value={selectedItems[pid] || 1}
+                        onChange={(e) => setSelectedItems(prev => ({
+                          ...prev,
+                          [pid]: Math.min(item.qty, Math.max(1, Number(e.target.value) || 1))
+                        }))}
+                        className="w-14 border rounded px-1 py-0.5 text-xs text-center"
+                        disabled={!selectedItems[pid]}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Reason */}
+            <div className="mb-3">
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                Reason *
+              </label>
+              <select
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+              >
+                <option value="">Select reason</option>
+                {RETURN_REASONS.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+
+            {/* Description */}
+            <div className="mb-3">
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                Description (optional)
+              </label>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={2}
+                className="w-full bg-slate-50 border border-slate-200 px-3 py-2 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] resize-none"
+                placeholder="Details batao..."
+              />
+            </div>
+
+            {/* Refund estimate */}
+            <div className="bg-green-50 border border-green-200 rounded-xl p-3 mb-3">
+              <div className="text-xs">
+                <span className="font-bold">Estimated Refund:</span> {formatCurrency(refundAmount)}
+              </div>
+              <div className="text-[10px] text-slate-500 mt-1">
+                {order.paymentMethod === 'online'
+                  ? 'Refund original payment method par item receive aur inspect hone ke baad process hoga. Bank/PayU timing vary kar sakti hai.'
+                  : 'Refund return approval ke baad aapke diye gaye account mein process hoga.'}
+              </div>
+            </div>
+
+            {submitError && (
+              <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-3">
+                {submitError}
+              </div>
+            )}
+
+            <button
+              onClick={submitReturn}
+              disabled={submitting}
+              className="w-full bg-orange-500 text-white font-bold py-3 rounded-xl text-sm hover:bg-orange-600 disabled:opacity-50"
+            >
+              {submitting ? '⏳ Submitting...' : '↩️ Submit Return Request'}
+            </button>
+          </>
+        )}
+
+        {/* STEP 5: Done */}
+        {step === 'done' && (
+          <div className="text-center py-4">
+            <div className="text-5xl mb-4">✅</div>
+            <h3 className="text-lg font-black text-[#0B3C5D] mb-2">Return Submitted!</h3>
+            <p className="text-xs text-slate-500 mb-4">
+              Return request admin ko bhej di gayi hai. Item receive aur inspect hone ke baad refund process hoga; online refunds original payment method par aate hain aur processing time gateway/bank par depend karta hai.
+            </p>
+            <button
+              onClick={onClose}
+              className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b]"
+            >
+              Close
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// FORGOT PASSWORD MODAL
+// =============================================
+const ForgotPasswordModal = ({ isOpen, onClose, onBackToLogin }) => {
+  const [step, setStep] = useState('phone');
+  const [phone, setPhone] = useState('');
+  const [otp, setOtp] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [resetToken, setResetToken] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [timer, setTimer] = useState(0);
+  const [resendDisabled, setResendDisabled] = useState(false);
+  const [testModeOtp, setTestModeOtp] = useState('');
+
+  useEffect(() => {
+    let interval;
+    if (timer > 0) {
+      interval = setInterval(() => {
+        setTimer(prev => prev - 1);
+      }, 1000);
+    } else {
+      setResendDisabled(false);
+    }
+    return () => clearInterval(interval);
+  }, [timer]);
+
+  const startTimer = () => {
+    setTimer(60);
+    setResendDisabled(true);
+  };
+
+  useEffect(() => {
+    if (!isOpen) {
+      setStep('phone');
+      setPhone('');
+      setOtp('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setResetToken('');
+      setError('');
+      setSuccess('');
+      setLoading(false);
+      setTestModeOtp('');
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  const handleSendOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setSuccess('');
+    setTestModeOtp('');
+
+    try {
+      const response = await axios.post(`${API_URL}/auth/forgot-password`, { phone });
+      
+      if (response.data.success) {
+        setStep('otp');
+        startTimer();
+        if (response.data.otp) {
+          setOtp(response.data.otp);
+          setTestModeOtp(response.data.otp);
+          setSuccess('✅ Test Mode — OTP auto-filled.');
+        } else {
+          setSuccess('✅ If an account exists, an OTP has been sent to its registered mobile number.');
+        }
+      } else {
+        setError(response.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to send OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setSuccess('');
+
+    try {
+      const response = await axios.post(`${API_URL}/auth/verify-otp`, {
+        phone,
+        otp: otp.trim() 
+      });
+      
+      if (response.data.success) {
+        setSuccess('✅ OTP verified successfully!');
+        setResetToken(response.data.resetToken);
+        setStep('reset');
+      } else {
+        setError(response.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to verify OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResetPassword = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setSuccess('');
+
+    if (newPassword !== confirmPassword) {
+      setError('Passwords do not match');
+      setLoading(false);
+      return;
+    }
+
+    if (newPassword.length < 8 || newPassword.length > 72) {
+      setError('Password must be 8-72 characters long');
+      setLoading(false);
+      return;
+    }
+
+    if (!resetToken) {
+      setError('Session expired. Please request a new OTP.');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const response = await axios.post(`${API_URL}/auth/reset-password`, {
+        phone,
+        newPassword,
+        resetToken
+      });
+      
+      if (response.data.success) {
+        setSuccess('✅ Password reset successfully!');
+        setTimeout(() => {
+          onClose();
+          onBackToLogin();
+        }, 2000);
+      } else {
+        setError(response.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to reset password. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResendOTP = async () => {
+    setLoading(true);
+    setError('');
+    setSuccess('');
+    setTestModeOtp('');
+
+    try {
+      const response = await axios.post(`${API_URL}/auth/forgot-password`, { phone });
+      
+      if (response.data.success) {
+        startTimer();
+        if (response.data.otp) {
+          setOtp(response.data.otp);
+          setTestModeOtp(response.data.otp);
+          setSuccess('✅ Test Mode — OTP auto-filled.');
+        } else {
+          setSuccess('✅ If an account exists, a new OTP has been sent to its registered mobile number.');
+        }
+      } else {
+        setError(response.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to resend OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div 
+      className="velqra-auth-overlay fixed inset-0 z-[100] flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div 
+        className="velqra-auth-modal relative max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button 
+          onClick={onClose} 
+          className="absolute top-4 right-4 text-slate-400 hover:text-black font-bold text-lg"
+        >
+          ✕
+        </button>
+        
+        <div className="flex items-center gap-3 mb-1">
+          <span className="text-2xl">🔑</span>
+          <h3 className="text-lg font-black text-[#0B3C5D]">
+            {step === 'phone' && 'Forgot Password'}
+            {step === 'otp' && 'Verify OTP'}
+            {step === 'reset' && 'Reset Password'}
+          </h3>
+        </div>
+        <p className="text-[11px] text-slate-400 mb-4">
+          {step === 'phone' && 'Enter your registered mobile number to receive an OTP'}
+          {step === 'otp' && `Enter the OTP sent to the mobile ending in ${phone.slice(-4)}`}
+          {step === 'reset' && 'Create a new password for your account'}
+        </p>
+
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+            {error}
+          </div>
+        )}
+
+        {success && (
+          <div className="bg-green-50 border border-green-200 text-green-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+            {success}
+          </div>
+        )}
+
+        {step === 'phone' && (
+          <form onSubmit={handleSendOTP} className="space-y-4">
+            <div>
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">Registered Mobile Number</label>
+              <input
+                type="tel"
+                required
+                inputMode="numeric"
+                autoComplete="tel"
+                minLength="10"
+                maxLength="14"
+                pattern="[6-9][0-9]{9}"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value.replace(/\D/g, '').slice(-10))}
+                placeholder="10-digit mobile number"
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] transition disabled:opacity-50"
+            >
+              {loading ? '⏳ Sending...' : 'Send OTP'}
+            </button>
+            <button
+              type="button"
+              onClick={onBackToLogin}
+              className="w-full text-center text-[10px] text-slate-400 hover:text-[#0B3C5D] transition"
+            >
+              ← Back to Login
+            </button>
+          </form>
+        )}
+
+        {step === 'otp' && (
+          <form onSubmit={handleVerifyOTP} className="space-y-4">
+            {testModeOtp && <TestModeBanner otp={testModeOtp} />}
+
+            <div>
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">OTP Code</label>
+              <input
+                type="text"
+                required
+                maxLength="6"
+                value={otp}
+                onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
+                placeholder="Enter 6-digit OTP"
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition text-center text-2xl font-bold tracking-widest"
+              />
+              <p className="text-[10px] text-slate-400 mt-1 text-center">OTP sent to mobile ending in {phone.slice(-4)}</p>
+            </div>
+
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-400">
+                {timer > 0 ? `Resend in ${timer}s` : "Didn't receive OTP?"}
+              </span>
+              <button
+                type="button"
+                onClick={handleResendOTP}
+                disabled={resendDisabled || loading}
+                className="font-bold text-[#0B3C5D] hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Resend OTP
+              </button>
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading || otp.length < 6}
+              className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] transition disabled:opacity-50"
+            >
+              {loading ? '⏳ Verifying...' : 'Verify OTP'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setStep('phone')}
+              className="w-full text-center text-[10px] text-slate-400 hover:text-[#0B3C5D] transition"
+            >
+              ← Change Mobile Number
+            </button>
+          </form>
+        )}
+
+        {step === 'reset' && (
+          <form onSubmit={handleResetPassword} className="space-y-4">
+            <div>
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">New Password</label>
+              <input
+                type="password"
+                required
+                minLength="8"
+                maxLength="72"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+              />
+              <p className="text-[9px] text-slate-400 mt-1">Password must be 8-72 characters long</p>
+            </div>
+
+            <div>
+              <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">Confirm Password</label>
+              <input
+                type="password"
+                required
+                minLength="8"
+                maxLength="72"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full bg-green-600 text-white font-bold py-3 rounded-xl text-sm hover:bg-green-700 transition disabled:opacity-50"
+            >
+              {loading ? '⏳ Resetting...' : '🔓 Reset Password'}
+            </button>
+
+            <button
+              type="button"
+              onClick={onBackToLogin}
+              className="w-full text-center text-[10px] text-slate-400 hover:text-[#0B3C5D] transition"
+            >
+              ← Back to Login
+            </button>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════
+// 🆕 ORDER OTP MODAL
+// ═══════════════════════════════════════════════════
+const OrderOTPModal = ({ isOpen, onClose, onVerified, phone, isGuest }) => {
+  const [otp, setOtp] = useState('');
+  const [challengeId, setChallengeId] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [timer, setTimer] = useState(0);
+  const [resendDisabled, setResendDisabled] = useState(false);
+  const [testModeOtp, setTestModeOtp] = useState('');
+  const [autoSending, setAutoSending] = useState(false);
+
+  useEffect(() => {
+    let interval;
+    if (timer > 0) {
+      interval = setInterval(() => setTimer(prev => prev - 1), 1000);
+    } else {
+      setResendDisabled(false);
+    }
+    return () => clearInterval(interval);
+  }, [timer]);
+
+  useEffect(() => {
+    if (isOpen) {
+      sendOrderOTP();
+    } else {
+      setOtp('');
+      setError('');
+      setSuccess('');
+      setTestModeOtp('');
+      setTimer(0);
+      setChallengeId('');
+    }
+  }, [isOpen, isGuest, phone]);
+
+  const startTimer = () => {
+    setTimer(60);
+    setResendDisabled(true);
+  };
+
+  const sendOrderOTP = async () => {
+    setAutoSending(true);
+    setError('');
+    setSuccess('');
+    setTestModeOtp('');
+    setChallengeId('');
+    try {
+      const token = sessionStorage.getItem('velqra_user_token');
+      const res = await axios.post(`${API_URL}/orders/send-otp`, { phone }, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      if (res.data.success) {
+        setChallengeId(res.data.challengeId || '');
+        startTimer();
+        if (res.data.otp) {
+          setOtp(res.data.otp);
+          setTestModeOtp(res.data.otp);
+          setSuccess('🧪 Test Mode — OTP auto-filled.');
+        } else {
+          setSuccess('✅ OTP sent to your mobile.');
+        }
+      } else {
+        setError(res.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to send OTP');
+    } finally {
+      setAutoSending(false);
+    }
+  };
+
+  const handleVerify = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setSuccess('');
+    if (otp.length !== 6) {
+      setError('Enter 6-digit OTP');
+      setLoading(false);
+      return;
+    }
+    try {
+      const token = sessionStorage.getItem('velqra_user_token');
+      const res = await axios.post(`${API_URL}/orders/verify-otp`, {
+        otp: otp.trim(),
+        ...(isGuest ? { challengeId, phone } : {})
+      }, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      if (res.data.success) {
+        setSuccess('✅ OTP verified! Placing order...');
+        setTimeout(() => onVerified(res.data.orderConfirmToken), 800);
+      } else {
+        setError(res.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to verify');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[130] flex items-center justify-center overflow-y-auto bg-slate-900/70 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="relative my-auto max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-slate-100 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-4 right-4 text-slate-400 hover:text-black font-bold text-lg">✕</button>
+        <div className="flex items-center gap-3 mb-1">
+          <span className="text-2xl">🔐</span>
+          <h3 className="text-lg font-black text-[#0B3C5D]">Order Confirmation</h3>
+        </div>
+        <p className="text-[11px] text-slate-400 mb-4">Verify OTP to confirm your order</p>
+
+        {autoSending && !testModeOtp && (
+          <div className="bg-blue-50 border border-blue-200 text-blue-600 text-xs font-medium px-4 py-2 rounded-xl mb-4 flex items-center gap-2">
+            <span className="animate-spin">⏳</span> Sending OTP to your mobile...
+          </div>
+        )}
+
+        {testModeOtp && <TestModeBanner otp={testModeOtp} />}
+        {error && <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">{error}</div>}
+        {success && <div className="bg-green-50 border border-green-200 text-green-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">{success}</div>}
+
+        <form onSubmit={handleVerify} className="space-y-4">
+          <div>
+            <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">Enter OTP</label>
+            <input
+              type="text"
+              required
+              maxLength="6"
+              value={otp}
+              onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
+              placeholder="6-digit OTP"
+              className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] text-center text-2xl font-bold tracking-widest"
+            />
+          </div>
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-400">
+              {timer > 0 ? `Resend in ${timer}s` : "Didn't get OTP?"}
+              {phone && ` · ${phone.slice(-4)}`}
+            </span>
+            <button
+              type="button"
+              onClick={sendOrderOTP}
+              disabled={resendDisabled || autoSending}
+              className="font-bold text-[#0B3C5D] hover:underline disabled:opacity-50"
+            >
+              Resend OTP
+            </button>
+          </div>
+          <button
+            type="submit"
+            disabled={loading || otp.length < 6}
+            className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b] disabled:opacity-50"
+          >
+            {loading ? '⏳ Verifying...' : '🔓 Verify & Place Order'}
+          </button>
+          <button type="button" onClick={onClose} className="w-full text-center text-[10px] text-slate-400 hover:text-[#0B3C5D]">← Cancel</button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+
+// =============================================
+// ABOUT PAGE
+// =============================================
+const POLICY_CONTENT = {
+  privacy: {
+    title: 'Privacy Policy',
+    intro: 'VELQRA explains below how information submitted through this website is used.',
+    sections: [
+      ['Information we collect', 'We collect account, contact and delivery details, order and payment confirmation information, support communications, device and browser data, and cookies required to operate and secure the website.'],
+      ['How we use information', 'Information is used to create accounts, process and support orders, communicate status updates and maintain service security.'],
+      ['Data protection', 'We take reasonable measures to protect stored information. No website or payment system can guarantee absolute security; please do not share passwords, OTPs or complete card details.'],
+      ['Purpose and lawful processing', 'Information is processed to verify accounts, fulfill purchases, prevent fraud, arrange delivery, respond to support requests, improve services and comply with applicable financial and legal record requirements.'],
+      ['Requests and retention', 'For a correction or account request, email officialvelqra@gmail.com. Certain records may be retained where needed to resolve an order, prevent fraud or meet applicable requirements.']
+    ]
+  },
+  terms: {
+    title: 'Terms & Conditions',
+    intro: 'These terms apply to purchases made through the VELQRA storefront.',
+    sections: [
+      ['Website use', 'You must provide accurate account, billing and delivery information and must not misuse the website, interfere with security controls, attempt unauthorized access or conduct fraudulent transactions.'],
+      ['Consumer disclosures', 'The displayed product description, final price, delivery charge, payment method, estimated delivery and applicable policies are shown before order confirmation. Packaging or presentation may vary from illustrative imagery.'],
+      ['Orders and availability', 'An order is confirmed only after successful placement and confirmation. Products, prices and availability may change before dispatch.'],
+      ['Pricing and payment', 'Prices are displayed in INR. Any delivery charge or discount applicable to an order will be shown before payment confirmation.'],
+      ['Account responsibility', 'Keep login credentials confidential and notify support promptly if you suspect unauthorized account activity.']
+    ]
+  },
+  returns: {
+    title: 'Return & Refund Policy',
+    intro: 'Return eligibility depends on the item condition and the reason reported for the request.',
+    sections: [
+      ['Return request', 'Report damaged, defective, incorrect or missing items within 48 hours of delivery, with the order ID and clear photos.'],
+      ['Eligible items', 'Products must be unused, in original packaging and include all accessories, labels and free items received with the order.'],
+      ['Sealed package requirement', 'Returns are accepted only when the original product seal remains intact and the package is unused. Refund is not available for opened, unsealed or tampered products.'],
+      ['Return deadline', 'A return request must be submitted within 7 days of delivery. The return option disappears automatically after this period.'],
+      ['Online payment refund', 'Returns and refunds are available only for orders paid online. The exact order ID must be entered to confirm the return request.'],
+      ['Refunds', 'Approved refunds are processed to the original payment method. Cash-on-delivery refunds may require verified bank details.'],
+      ['Non-returnable items', 'Personal care, hygiene, opened consumables and specially customized products may not be returnable unless they arrived damaged or defective.']
+    ]
+  },
+  shipping: {
+    title: 'Shipping Policy',
+    intro: 'Dispatch and delivery estimates may vary by location, product availability and courier conditions.',
+    sections: [
+      ['Processing time', 'Most confirmed orders are processed within 1-3 business days, excluding public holidays and service disruptions.'],
+      ['Delivery time', 'Delivery timelines vary by location and product. The estimated date shown at checkout is indicative and may change due to courier availability.'],
+      ['Shipping address', 'Customers must provide a complete and accurate delivery address. Incorrect details may delay delivery or prevent fulfillment.'],
+      ['Tracking', 'Tracking details are shared when available. Contact support if your order has not moved within the expected processing period.'],
+      ['Service coverage', 'Availability, courier coverage and delivery estimates depend on the destination PIN code. Delivery is free on all orders.'],
+      ['Delivery confirmation', 'Where permitted, inspect the outer package before accepting it. Report visible damage, leakage, missing items or an altered seal immediately with photographs through Contact Policy.']
+    ]
+  },
+  contact: {
+    title: 'Contact Policy',
+    intro: 'Contact support using the verified details shown in the footer for order, payment, delivery or account questions.',
+    sections: [
+      ['Support email', 'Email officialvelqra@gmail.com with your order number and a clear description of the issue.'],
+      ['Phone and WhatsApp', 'Call or WhatsApp us at +91 90500 54177 for order, payment, delivery or account support.'],
+      ['Location', 'Near Priyanka Dhaba, Balaji Hospital, Ward No. 11, Ateli Mandi, Mahendragarh, Haryana. Map coordinates: 28.1038478, 76.2499368.'],
+      ['Response time', 'We aim to respond within 1-2 business days. Order or delivery cases may require additional time for courier verification.'],
+      ['Information required', 'Please include your registered name, order ID and relevant screenshots. Do not share passwords, full card numbers or OTPs.'],
+      ['Escalations', 'If a resolution remains unresolved, reply to the latest support email and mark the message for follow-up.']
+    ]
+  }
+};
+
+const PolicyPage = ({ policy }) => {
+  const content = POLICY_CONTENT[policy];
+  return (
+    <main className="min-h-[70vh] bg-[#f1f1ef] px-4 py-8 text-[#252525] sm:px-6 md:py-14">
+      <article className="mx-auto max-w-5xl">
+        <div className="overflow-hidden rounded-2xl bg-[#173b32] px-6 py-9 text-white shadow-sm sm:px-9 md:px-12 md:py-12">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-[#d4af37]">VELQRA · Information</p>
+          <h1 className="mt-3 text-3xl font-semibold leading-tight tracking-[-0.02em] sm:text-4xl md:text-[42px]">{content.title}</h1>
+          <p className="mt-4 max-w-3xl text-sm leading-7 text-white/80 sm:text-base">{content.intro}</p>
+        </div>
+
+        <div className="mt-6 space-y-3 sm:mt-8 sm:space-y-4">
+          {content.sections.map(([heading, text], index) => (
+            <section key={heading} className="flex gap-4 rounded-xl border border-[#e2e1da] bg-white p-5 shadow-[0_3px_14px_rgba(20,35,28,0.035)] sm:gap-5 sm:p-6 md:p-7">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#edf2ed] text-xs font-bold tracking-wide text-[#173b32]">
+                {String(index + 1).padStart(2, '0')}
+              </span>
+              <div className="min-w-0 pt-1">
+                <h2 className="text-base font-semibold leading-snug text-[#202020] sm:text-lg">{heading}</h2>
+                <p className="mt-2 text-sm leading-7 text-[#555] sm:text-[15px] sm:leading-7">{text}</p>
+              </div>
+            </section>
+          ))}
+        </div>
+
+        {policy === 'contact' && (
+          <div className="mt-6 overflow-hidden rounded-xl border border-[#e2e1da] bg-white p-2 shadow-sm sm:mt-8">
+            <iframe
+              title="VELQRA location map"
+              src="https://www.google.com/maps?q=28.1038478,76.2499368&z=19&output=embed"
+              className="h-64 w-full rounded-lg border-0 sm:h-80"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              allowFullScreen
+            />
+          </div>
+        )}
+
+        <p className="mt-6 text-right text-xs text-[#777]">Last updated: November 2026</p>
+      </article>
+    </main>
+  );
+};
+
+const NotFoundPage = () => (
+  <main className="flex min-h-[60vh] items-center justify-center bg-[#f1f1ef] px-4 py-16 text-center text-[#252525]">
+    <section className="max-w-lg">
+      <p className="text-sm font-bold uppercase tracking-[0.18em] text-[#173b32]">404 · Page not found</p>
+      <h1 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">This page doesn’t exist</h1>
+      <p className="mt-3 text-sm leading-6 text-[#626262]">
+        The link may be incorrect or the page may have moved. Visit the home page to continue shopping.
+      </p>
+      <Link
+        to="/"
+        className="mt-7 inline-flex rounded-lg bg-[#173b32] px-5 py-3 text-sm font-bold text-white transition hover:bg-[#102a24]"
+      >
+        Back to home
+      </Link>
+    </section>
+  </main>
+);
+
+const DeveloperAboutLegacyPage = () => {
+  return (
+    <div className="container mx-auto max-w-4xl px-4 py-12">
+      <div className="text-center mb-12">
+        <span className="inline-block bg-[#0B3C5D]/10 text-[#0B3C5D] text-xs font-bold uppercase tracking-wider px-3 py-1 rounded-full mb-3">
+          About Us
+        </span>
+        <h1 className="text-4xl md:text-5xl font-black text-slate-900 mb-4">
+          Welcome to <span className="text-[#0B3C5D]">Ateli</span>
+          <span className="text-[#FF5722]">Market</span>
+        </h1>
+        <p className="text-lg text-slate-600 max-w-2xl mx-auto">
+          Your trusted online shopping destination. Quality products, best prices, and exceptional service.
+        </p>
+      </div>
+
+      <div className="bg-white rounded-3xl border border-slate-200 shadow-lg overflow-hidden mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-0">
+          <div className="md:col-span-1 bg-gradient-to-br from-[#0B3C5D] to-[#1a6496] p-8 flex items-center justify-center">
+            <div className="relative">
+              <div className="w-48 h-48 rounded-full border-4 border-white/20 overflow-hidden shadow-2xl">
+                <img 
+                  src="/Dev.jpg" 
+                  alt="Gourav Sharma - Developer" 
+                  loading="lazy"
+                  decoding="async"
+                  className="w-full h-full object-cover"
+                  onError={(e) => {
+                    e.target.onerror = null;
+                    e.target.src = 'https://ui-avatars.com/api/?name=Gourav+Sharma&size=200&background=0B3C5D&color=fff';
+                  }}
+                />
+              </div>
+              <div className="absolute -bottom-2 -right-2 bg-green-500 text-white text-xs font-bold px-3 py-1 rounded-full shadow-lg">
+                🚀 Active
+              </div>
+            </div>
+          </div>
+          <div className="md:col-span-2 p-8">
+            <h2 className="text-2xl font-black text-slate-800 mb-2 flex items-center gap-2">
+              <span>👨‍💻</span> Developer
+            </h2>
+            <h3 className="text-2xl font-bold text-[#0B3C5D] mb-1">Gourav Sharma</h3>
+            <p className="text-sm font-medium text-[#FF5722] mb-2">B.Tech Final Year Student</p>
+            <p className="text-sm text-slate-500 mb-4">IGU University, Meerpur</p>
+            <div className="bg-slate-50 rounded-xl p-4 mb-4 border border-slate-100">
+              <p className="text-sm text-slate-700 leading-relaxed">
+                I'm Gourav Sharma, a passionate B.Tech final year student at IGU University 
+                with a strong interest in full-stack web development. I built VELQRA to
+                create a seamless online shopping experience using modern technologies like 
+                React, Node.js, and Supabase.
+              </p>
+            </div>
+            <div className="mt-6 pt-4 border-t border-slate-100">
+              <p className="text-xs font-bold uppercase text-slate-400 mb-3">Connect with Developer</p>
+              <div className="flex flex-wrap gap-3">
+                <a href="https://github.com/pandit777" target="_blank" rel="noopener noreferrer" className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg transition flex items-center gap-2">
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.15 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.62.24 2.85.12 3.15.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+                  </svg>
+                  <span className="text-sm font-medium">GitHub</span>
+                </a>
+                <a href="mailto:officialvelqra@gmail.com" className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg transition flex items-center gap-2">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                  </svg>
+                  <span className="text-sm font-medium">Email</span>
+                </a>
+                <a href="tel:+919050054177" className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg transition flex items-center gap-2">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/>
+                  </svg>
+                  <span className="text-sm font-medium">Phone</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const AboutPage = () => (
+  <main className="min-h-[60vh] bg-[#f1f1ef] px-4 py-8 text-[#252525] sm:px-6 md:py-14" aria-label="About VELQRA">
+    <article className="mx-auto max-w-6xl">
+      <div className="overflow-hidden rounded-2xl bg-[#173b32] px-6 py-10 text-white shadow-sm sm:px-10 md:px-14 md:py-14">
+        <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#d4af37]">About VELQRA</p>
+        <h1 className="mt-4 max-w-3xl font-serif text-3xl font-semibold leading-tight sm:text-4xl md:text-5xl">
+          Thoughtful skincare, made part of everyday life.
+        </h1>
+        <p className="mt-5 max-w-2xl text-sm leading-7 text-white/80 sm:text-base">
+          VELQRA brings together botanical-inspired skincare and a straightforward way to shop, so choosing everyday care feels clear and considered.
+        </p>
+      </div>
+
+      <section className="grid gap-8 py-10 md:grid-cols-[1.2fr_0.8fr] md:gap-14 md:py-14">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.18em] text-[#8b6e2d]">Our point of view</p>
+          <h2 className="mt-3 font-serif text-2xl font-semibold leading-snug text-[#202020] sm:text-3xl">
+            Good shopping starts with clarity.
+          </h2>
+        </div>
+        <p className="text-sm leading-7 text-[#555] sm:text-base">
+          From product details to delivery information, we aim to make the essentials easy to understand. Our focus is on considered product presentation, transparent information and dependable customer support.
+        </p>
+      </section>
+
+      <section aria-label="What you can expect" className="grid gap-4 border-t border-[#dedede] py-8 sm:grid-cols-3 md:py-10">
+        {[
+          ['01', 'Considered products', 'Explore skincare selected for a simple, everyday routine.'],
+          ['02', 'Clear information', 'Find product, order and policy details in one easy-to-navigate store.'],
+          ['03', 'Here to help', 'Reach our support team when you need help with an order or account.']
+        ].map(([number, title, description]) => (
+          <div key={number} className="rounded-xl border border-[#e1e0da] bg-white p-5 sm:p-6">
+            <p className="text-xs font-bold tracking-[0.16em] text-[#8b6e2d]">{number}</p>
+            <h3 className="mt-3 text-base font-semibold text-[#202020]">{title}</h3>
+            <p className="mt-2 text-sm leading-6 text-[#626262]">{description}</p>
+          </div>
+        ))}
+      </section>
+
+      <section className="flex flex-col gap-4 rounded-xl border border-[#deded7] bg-[#e9e9e3] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-7">
+        <div>
+          <h2 className="text-lg font-semibold text-[#202020]">Need a hand?</h2>
+          <p className="mt-1 text-sm leading-6 text-[#626262]">Our support team can help with orders, delivery and account questions.</p>
+        </div>
+        <Link
+          to="/contact-policy"
+          className="inline-flex shrink-0 justify-center rounded-lg bg-[#173b32] px-5 py-3 text-sm font-bold text-white transition hover:bg-[#102a24]"
+        >
+          Contact us
+        </Link>
+      </section>
+    </article>
+  </main>
+);
+
+// =============================================
+// PRODUCT DETAIL PAGE - WITH VIDEO & ATTRIBUTES
+// =============================================
+const ProductDetailPage = ({ addToCart, openCheckout, onOpenReviews, onReviewSummaryUpdated }) => {
+  const { t, formatCurrency } = useLocalization();
+  const { id } = useParams();
+  const [product, setProduct] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [mainImage, setMainImage] = useState('');
+  const [activeMediaIndex, setActiveMediaIndex] = useState(0);
+  const [selectedAttributes, setSelectedAttributes] = useState({});
+  const [promoInput, setPromoInput] = useState('');
+  const [promoApplied, setPromoApplied] = useState(false);
+  const [addingToCart, setAddingToCart] = useState(false);
+  const [activeHotspot, setActiveHotspot] = useState(null);
+  const [showQuickBuy, setShowQuickBuy] = useState(false);
+  const navigate = useNavigate();
+  const mediaGalleryRef = useRef(null);
+  const addToCartButtonRef = useRef(null);
+
+  useEffect(() => {
+    const button = addToCartButtonRef.current;
+    if (!button) return undefined;
+
+    if (!('IntersectionObserver' in window)) {
+      const updateQuickBuy = () => setShowQuickBuy(button.getBoundingClientRect().bottom < 0);
+      window.addEventListener('scroll', updateQuickBuy, { passive: true });
+      updateQuickBuy();
+      return () => window.removeEventListener('scroll', updateQuickBuy);
+    }
+
+    const observer = new IntersectionObserver(([entry]) => {
+      setShowQuickBuy(!entry.isIntersecting);
+    }, { threshold: 0 });
+    observer.observe(button);
+    return () => observer.disconnect();
+  }, [product?._id]);
+
+  useEffect(() => {
+    const fetchProductDetails = async () => {
+      const cachedProduct = getCachedProducts().find(item => String(item._id || item.id) === id);
+      if (cachedProduct) {
+        const productData = normalizeProduct(cachedProduct);
+        setProduct(productData);
+        const cachedImage = getProductDisplayImage(productData);
+        setMainImage(cachedImage);
+        setActiveMediaIndex(0);
+        if (productData.attributes && typeof productData.attributes === 'object') {
+          setSelectedAttributes(Object.fromEntries(
+            Object.entries(productData.attributes)
+              .filter(([, values]) => Array.isArray(values) && values.length > 0)
+              .map(([key, values]) => [key, values[0]])
+          ));
+        }
+        setLoading(false);
+      }
+
+      try {
+        if (!cachedProduct) setLoading(true);
+        if (!isSupabaseConfigured) {
+          if (cachedProduct) return;
+          throw new Error('Supabase is not configured');
+        }
+        let result = await supabase
+          .from('products')
+          .select('*')
+          .eq('id', id)
+          .maybeSingle();
+
+        if (result.error?.code === '42703') {
+          result = await supabase
+            .from('products')
+            .select('*')
+            .eq('_id', id)
+            .maybeSingle();
+        }
+
+        const { data, error } = result;
+
+        if (error) throw error;
+        if (data) {
+          const productData = normalizeProduct(data);
+          setProduct(productData);
+          
+          const mainImg = getProductDisplayImage(productData);
+          setMainImage(mainImg);
+          setActiveMediaIndex(0);
+          
+          if (productData.attributes && typeof productData.attributes === 'object') {
+            const initialAttrs = {};
+            Object.keys(productData.attributes).forEach(key => {
+              const values = productData.attributes[key];
+              if (Array.isArray(values) && values.length > 0) {
+                initialAttrs[key] = values[0];
+              }
+            });
+            setSelectedAttributes(initialAttrs);
+          }
+        } else {
+          if (!cachedProduct) setError('Product not found');
+        }
+      } catch (err) {
+        if (!cachedProduct) setError(err.message || err.response?.data?.message || 'Failed to fetch product');
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchProductDetails();
+  }, [id]);
+
+  const handleAddToCart = async (options = {}) => {
+    if (!product || addingToCart) return false;
+    const { openCartPage = true } = options;
+    
+    if (product.attributes && Object.keys(product.attributes).length > 0) {
+      const allSelected = Object.keys(product.attributes).every(key => {
+        return selectedAttributes[key] && selectedAttributes[key].trim() !== '';
+      });
+      
+      if (!allSelected) {
+        alert('Please select all options before adding to cart.');
+        return false;
+      }
+    }
+    
+    const productWithAttributes = {
+      ...product,
+      selectedAttributes,
+      promoApplied,
+      promoCode: promoApplied ? product.promoCode : '',
+      price: promoApplied
+        ? Math.round(product.price * (1 - (Number(product.promoDiscount) || 0) / 100))
+        : product.price
+    };
+    
+    setAddingToCart(true);
+    try {
+      if (addToCart) {
+        return await addToCart(productWithAttributes, { openCartPage });
+      }
+      const event = new CustomEvent('addToCart', { detail: productWithAttributes });
+      window.dispatchEvent(event);
+      return true;
+    } finally {
+      setAddingToCart(false);
+    }
+  };
+
+  const handleBuyNow = async () => {
+    const added = await handleAddToCart({ openCartPage: false });
+    if (added && openCheckout) openCheckout();
+  };
+
+  const handleAttributeChange = (key, value) => {
+    setSelectedAttributes(prev => ({
+      ...prev,
+      [key]: value
+    }));
+  };
+
+  const handleReviewSummaryUpdate = (productId, summary) => {
+    if (summary.rating !== null && summary.reviewsCount !== null) {
+      setProduct(currentProduct => currentProduct ? {
+        ...currentProduct,
+        rating: summary.rating,
+        reviewsCount: summary.reviewsCount,
+        reviews_count: summary.reviewsCount
+      } : currentProduct);
+    }
+    onReviewSummaryUpdated?.(productId, summary);
+  };
+
+  const applyProductPromo = () => {
+    if (!product?.promoCode) {
+      return;
+    }
+    if (promoInput.trim().toUpperCase() === String(product.promoCode).toUpperCase()) {
+      setPromoApplied(true);
+    } else {
+      setPromoApplied(false);
+      alert('Invalid promo code for this product.');
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="velqra-product-detail container mx-auto max-w-6xl px-4 py-10" aria-label="Loading product details" aria-busy="true">
+        <div className="grid gap-8 md:grid-cols-2">
+          <div className="velqra-skeleton-image aspect-square rounded-2xl" />
+          <div className="space-y-5 pt-4">
+            <div className="velqra-skeleton-line velqra-skeleton-short" />
+            <div className="velqra-skeleton-line h-10" />
+            <div className="velqra-skeleton-line velqra-skeleton-price" />
+            <div className="velqra-skeleton-line h-14" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !product) {
+    return (
+      <div className="velqra-product-error container mx-auto px-4 py-20 text-center" role="alert">
+        <div className="text-6xl mb-4">😕</div>
+        <h3 className="text-red-500 font-bold text-lg">{error || 'Product not found'}</h3>
+        <Link to="/" className="mt-4 inline-block px-6 py-2.5 text-sm font-bold transition">
+          ← Back to Shopping
+        </Link>
+      </div>
+    );
+  }
+
+  const images = (Array.isArray(product.images) ? product.images : []).filter(Boolean);
+  if (images.length === 0) images.push(product.image || product.imageUrl || mainImage);
+  const textureImage = product.textureImageUrl || product.texture_image_url || product.textureImage || product.texture_image || '';
+  const ingredientHotspots = Array.isArray(product.ingredientHotspots || product.ingredient_hotspots)
+    ? (product.ingredientHotspots || product.ingredient_hotspots).filter(hotspot =>
+      hotspot && hotspot.x !== null && hotspot.x !== undefined && String(hotspot.x).trim() !== '' &&
+      hotspot.y !== null && hotspot.y !== undefined && String(hotspot.y).trim() !== '' &&
+      Number.isFinite(Number(hotspot.x)) && Number.isFinite(Number(hotspot.y)) &&
+      Number(hotspot.x) >= 0 && Number(hotspot.x) <= 100 &&
+      Number(hotspot.y) >= 0 && Number(hotspot.y) <= 100 &&
+      (hotspot.name || hotspot.title) && (hotspot.description || hotspot.detail)
+    )
+    : [];
+  const hasAttributes = product.attributes && Object.keys(product.attributes).length > 0;
+  const actualReviewsCount = Number(product.reviewsCount ?? product.reviews_count ?? 0);
+  const demoReviewSummary = getDemoReviewSummary(product);
+  const displayedRating = actualReviewsCount ? Number(product.rating || 0) : demoReviewSummary.rating;
+  const displayedReviewsCount = actualReviewsCount || demoReviewSummary.reviewsCount;
+  const hasVideo = Boolean(product.videoUrl && product.videoUrl.trim());
+  const videoUrl = hasVideo ? getProductVideoUrl(product) : '';
+  const youtubeId = getYouTubeId(videoUrl);
+  const vimeoId = getVimeoId(videoUrl);
+  const imageMedia = images.map(url => ({ type: 'image', url }));
+  if (textureImage) imageMedia.push({ type: 'texture', url: textureImage });
+  const videoMedia = hasVideo ? [{
+    type: product.videoType === 'uploaded' ? 'uploadedVideo' : 'linkedVideo',
+    url: videoUrl
+  }] : [];
+  const mediaItems = [
+    ...imageMedia.slice(0, 1),
+    ...videoMedia,
+    ...imageMedia.slice(1)
+  ];
+  const promoPrice = promoApplied
+    ? Math.round(product.price * (1 - (Number(product.promoDiscount) || 0) / 100))
+    : product.price;
+  const promoSavings = promoApplied ? product.price - promoPrice : 0;
+
+  const productDetails = [
+    ['Key Botanical Actives', getProductMetadata(product, ['botanicalActives', 'botanical_actives', 'keyActives', 'key_actives'])],
+    ['How to Use', getProductMetadata(product, ['howToUse', 'how_to_use', 'usageInstructions', 'usage_instructions'])],
+    ['pH & Skin Suitability', getProductMetadata(product, ['phSkinSuitability', 'ph_skin_suitability', 'skinSuitability', 'skin_suitability', 'ph'])],
+    ['Full Ingredient List', getProductMetadata(product, ['fullIngredientList', 'full_ingredient_list', 'ingredients', 'ingredientList', 'ingredient_list'])],
+    ['Description', product.description || '']
+  ].filter(([, content]) => Boolean(content));
+
+  return (
+    <div className="velqra-product-detail container mx-auto max-w-6xl px-4 py-8 overflow-x-hidden text-[#171717]">
+      <nav className="mb-6 text-sm text-slate-400 break-words">
+        <Link to="/" className="hover:text-[#0B3C5D] transition">Home</Link>
+        <span className="mx-2">/</span>
+        <Link to={`/?category=${product.category}`} className="hover:text-[#0B3C5D] transition">{product.category}</Link>
+        <span className="mx-2">/</span>
+        <span className="font-medium text-slate-700 break-words">{product.name}</span>
+      </nav>
+
+      <div className="grid w-full grid-cols-1 gap-8 md:grid-cols-2" data-reveal>
+        <div className="min-w-0 space-y-4">
+          <div
+            ref={mediaGalleryRef}
+            onScroll={(event) => setActiveMediaIndex(Math.round(
+              event.currentTarget.scrollLeft / event.currentTarget.clientWidth
+            ))}
+            className="flex aspect-square max-h-[28rem] w-full snap-x snap-mandatory overflow-x-auto overflow-y-hidden rounded-2xl border border-slate-200 bg-white shadow-sm touch-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
+            {mediaItems.map((media, index) => (
+              <div key={`${media.type}-${index}`} className="relative flex h-full w-full shrink-0 snap-center items-center justify-center">
+                {media.type === 'uploadedVideo' ? (
+                  <ProductDetailVideo
+                    src={media.url}
+                    poster={getProductDisplayImage(product)}
+                  />
+                ) : media.type === 'linkedVideo' ? (
+                  product.videoType === 'youtube' && youtubeId ? (
+                    <ProductDetailVideoEmbed
+                      src={`https://www.youtube.com/embed/${youtubeId}`}
+                      title={product.name}
+                      videoType={product.videoType}
+                    />
+                  ) : product.videoType === 'vimeo' && vimeoId ? (
+                    <ProductDetailVideoEmbed
+                      src={`https://player.vimeo.com/video/${vimeoId}`}
+                      title={product.name}
+                      videoType={product.videoType}
+                    />
+                  ) : (
+                    <div className="flex h-full w-full flex-col items-center justify-center text-slate-400">
+                      <span className="text-4xl mb-2">🎬</span>
+                      <p className="text-sm">Video not available</p>
+                      <p className="max-w-full break-all px-4 text-xs text-slate-300 mt-1">{videoUrl || 'No video URL provided'}</p>
+                    </div>
+                  )
+                ) : (
+                  <img
+                    src={media.url}
+                    alt={media.type === 'texture' ? `${product.name} texture` : `${product.name} ${index + 1}`}
+                    loading={index === 0 ? 'eager' : 'lazy'}
+                    decoding="async"
+                    className="h-full w-full rounded-xl object-contain p-4"
+                    onError={(e) => {
+                      e.target.onerror = null;
+                      e.target.src = getProductDisplayImage(product);
+                    }}
+                  />
+                )}
+                {media.type === 'texture' && (
+                  <span className="velqra-texture-label">{t('Texture')}</span>
+                )}
+                {media.type === 'image' && index === 0 && ingredientHotspots.map((hotspot, hotspotIndex) => (
+                  <div
+                    key={`${hotspot.name || hotspot.title}-${hotspotIndex}`}
+                    className="velqra-ingredient-hotspot"
+                    style={{ left: `${Number(hotspot.x)}%`, top: `${Number(hotspot.y)}%` }}
+                  >
+                    <button
+                      type="button"
+                      className="velqra-ingredient-dot"
+                      aria-label={hotspot.name || hotspot.title}
+                      aria-expanded={activeHotspot === hotspotIndex}
+                      onClick={() => setActiveHotspot(current => current === hotspotIndex ? null : hotspotIndex)}
+                    />
+                    {activeHotspot === hotspotIndex && (
+                      <div className="velqra-ingredient-tooltip" role="status">
+                        <strong>{hotspot.name || hotspot.title}</strong>
+                        <span>{hotspot.description || hotspot.detail}</span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+
+          {mediaItems.length > 1 && (
+            <div className="flex gap-3 overflow-x-auto pb-2 touch-auto">
+              {mediaItems.map((media, index) => (
+                <button
+                  key={`${media.type}-${index}`}
+                  onClick={() => {
+                    const gallery = mediaGalleryRef.current;
+                    if (gallery) gallery.scrollTo({ left: index * gallery.clientWidth, behavior: 'smooth' });
+                    setActiveMediaIndex(index);
+                  }}
+                  className={`relative h-20 w-20 flex-shrink-0 overflow-hidden rounded-xl border-2 transition ${
+                    activeMediaIndex === index ? 'border-[#0B3C5D] shadow-md' : 'border-slate-200 hover:border-slate-400'
+                  }`}
+                  aria-label={media.type === 'texture' ? t('Texture') : `${product.name} ${index + 1}`}
+                >
+                  {media.type === 'image' ? (
+                    <img
+                      src={media.url}
+                      alt={`${product.name} ${index + 1}`}
+                      loading="lazy"
+                      decoding="async"
+                      className="h-full w-full bg-white object-contain p-1"
+                    />
+                  ) : media.type === 'texture' ? (
+                    <img src={media.url} alt="" className="h-full w-full bg-white object-cover" loading="lazy" />
+                  ) : (
+                    <span className="flex h-full w-full items-center justify-center bg-slate-900 text-2xl text-white" aria-label="Video">▶</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="min-w-0 space-y-6 break-words">
+          <div>
+            <span className="inline-block bg-slate-100 text-slate-500 text-xs font-bold uppercase tracking-wider px-3 py-1 rounded-full mb-3">
+              {product.category}
+            </span>
+            <h1 className="w-full break-words [overflow-wrap:anywhere] text-3xl font-black leading-tight text-[#171717] sm:text-4xl">{product.name}</h1>
+            {product.brand && (
+              <p className="text-sm text-slate-500 mt-1">{t('Brand:')} <span className="font-medium">{product.brand}</span></p>
+            )}
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <ReviewStars value={displayedRating} />
+              <span className="text-sm font-bold text-slate-600">
+                {displayedRating ? displayedRating.toFixed(1) : t('No ratings')}
+              </span>
+              {demoReviewSummary.reviewsCount > 0 && (
+                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-black uppercase tracking-wide text-amber-800">
+                  Demo
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => onOpenReviews?.(product)}
+                className="rounded-full border border-[#173b32] px-3 py-1 text-xs font-bold text-[#173b32] transition hover:bg-[#173b32] hover:text-white"
+              >
+                {t('All reviews')} ({displayedReviewsCount})
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-5">
+            <div className="flex items-baseline gap-3 flex-wrap">
+              <span className="text-3xl font-black text-[#173b32]">{formatCurrency(promoPrice)}</span>
+              {product.discountPercent > 0 && (
+                <>
+                  <span className="text-lg text-slate-500 line-through">{formatCurrency(product.originalPrice)}</span>
+                  {promoApplied && (
+                    <span className="text-sm text-slate-500 line-through">{formatCurrency(product.price)}</span>
+                  )}
+                  <span className="bg-green-100 text-green-700 font-bold text-sm px-3 py-1 rounded-full">
+                    -{product.discountPercent}% OFF
+                  </span>
+                </>
+              )}
+            </div>
+            {product.discountPercent > 0 && (
+              <p className="text-sm text-green-600 font-medium mt-1">
+                {t('You save')} {formatCurrency(product.originalPrice - promoPrice)}
+              </p>
+            )}
+            {!product.discountPercent && promoApplied && (
+              <p className="text-sm text-green-600 font-medium mt-1">
+                {t('Promo savings')}: {formatCurrency(promoSavings)}
+              </p>
+            )}
+          </div>
+
+          {product.promoCode && (
+            <div className="rounded-2xl border border-green-200 bg-green-50 p-5">
+              <p className="mb-2 text-xs font-bold uppercase tracking-wide text-green-700">{t('Promo offer on this product')}</p>
+              <div className="flex gap-2">
+                <input
+                  value={promoInput}
+                  onChange={(event) => {
+                    setPromoInput(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''));
+                    setPromoApplied(false);
+                  }}
+                  placeholder={t('Enter promo code')}
+                  className="min-w-0 flex-1 rounded-xl border border-green-200 bg-white px-3 py-2.5 text-sm font-bold uppercase text-black caret-black placeholder:text-slate-500 outline-none focus:border-green-600"
+                />
+                <button
+                  type="button"
+                  onClick={applyProductPromo}
+                  className="rounded-xl bg-green-700 px-4 text-sm font-bold text-white hover:bg-green-800"
+                >
+                  {t('Apply')}
+                </button>
+              </div>
+              {promoApplied && (
+                <p className="mt-3 text-sm font-bold text-green-700">
+                  {product.promoDiscount}% extra discount applied — save {formatCurrency(Math.round(product.price * product.promoDiscount / 100))}
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="velqra-product-actions grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              ref={addToCartButtonRef}
+              onClick={handleAddToCart}
+              disabled={product.stock <= 0 || addingToCart}
+              className={`rounded-xl py-3.5 font-bold text-sm uppercase tracking-wide transition ${
+                product.stock > 0
+                  ? 'bg-amber-400 text-black hover:bg-amber-500 shadow-md'
+                  : 'cursor-not-allowed bg-slate-700 text-slate-400'
+              }`}
+            >
+              {product.stock <= 0 ? t('Out of Stock') : addingToCart ? t('Adding...') : t('Add to Cart')}
+            </button>
+            <button
+              type="button"
+              onClick={handleBuyNow}
+              disabled={product.stock <= 0 || addingToCart}
+              className="rounded-xl border border-[#173b32] bg-transparent py-3.5 text-sm font-bold uppercase tracking-wide text-[#173b32] transition hover:bg-[#173b32] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {product.stock <= 0 ? t('Out of Stock') : t('Buy Now')}
+            </button>
+          </div>
+
+          {/* ✅ ATTRIBUTES */}
+          {hasAttributes && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-5">
+              <h3 className="font-bold text-sm text-slate-700 mb-4 flex items-center gap-2">
+                <span>📋</span> {t('Select Options')}
+              </h3>
+              <div className="space-y-4">
+                {Object.entries(product.attributes).map(([key, values]) => (
+                  <div key={key}>
+                      <label className="mb-1.5 block break-words text-xs font-bold uppercase text-slate-400">
+                      {key}
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.isArray(values) && values.map((value) => (
+                        <button
+                          key={value}
+                          onClick={() => handleAttributeChange(key, value)}
+                          className={`px-4 py-2 rounded-xl text-sm font-bold transition border-2 ${
+                            selectedAttributes[key] === value
+                              ? 'border-[#0B3C5D] bg-[#0B3C5D] text-white shadow-md'
+                              : 'border-slate-200 bg-white text-slate-700 hover:border-[#0B3C5D] hover:bg-slate-50'
+                          }`}
+                        >
+                          <span className="break-words">{value}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 text-xs text-slate-400">
+                {Object.keys(selectedAttributes).length > 0 && (
+                  <span>{t('Selected:')} {Object.entries(selectedAttributes).map(([key, value]) => `${key}: ${value}`).join(', ')}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center gap-3">
+            <div className={`flex items-center gap-2 ${product.stock > 0 ? 'text-green-600' : 'text-red-500'}`}>
+              <span className={`w-2 h-2 rounded-full ${product.stock > 0 ? 'bg-green-500' : 'bg-red-500'}`}></span>
+              <span className="font-bold text-sm">
+                {product.stock > 0 ? t('In Stock ({count} available)', { count: product.stock }) : t('Out of Stock')}
+              </span>
+            </div>
+          </div>
+
+          {productDetails.length > 0 && (
+            <div className="velqra-product-details">
+              {productDetails.map(([title, content], index) => (
+                <details className="velqra-product-accordion" key={title} open={index === 0}>
+                  <summary>{t(title)}</summary>
+                  <p>{content}</p>
+                </details>
+              ))}
+            </div>
+          )}
+
+          <div className="flex gap-3">
+            <Link to="/" className="px-6 py-3.5 rounded-xl font-bold text-sm border border-slate-300 text-slate-700 hover:bg-slate-100 transition">
+              ← Back
+            </Link>
+          </div>
+
+          <div className="flex justify-center gap-6 text-xs text-slate-400 pt-4 border-t border-slate-100">
+            <span>✅ Secure Checkout</span>
+            <span>🚚 Free Delivery</span>
+            <span>🔄 7-Day Return</span>
+          </div>
+        </div>
+      </div>
+      {showQuickBuy && (
+        <div className="velqra-quick-buy" role="region" aria-label={t('Quick add')}>
+          <div>
+            <strong>{product.name}</strong>
+            <span>{formatCurrency(promoPrice)}</span>
+          </div>
+          <button type="button" onClick={handleAddToCart} disabled={product.stock <= 0 || addingToCart}>
+            {addingToCart ? t('Adding...') : t('Add to Cart')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
+// ORDERS PAGE
+// =============================================
+const OrdersPage = ({ onLoginRequest, onOpenReviews }) => {
+  const { t, formatCurrency, language } = useLocalization();
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [guestOrderId] = useState(() => new URLSearchParams(window.location.search).get('guestOrder') || '');
+  const [isGuestOrder, setIsGuestOrder] = useState(false);
+  const [invoiceLoadingId, setInvoiceLoadingId] = useState(null);
+  const [returnModalOrder, setReturnModalOrder] = useState(null);
+  const [paymentCheckingId, setPaymentCheckingId] = useState(null);
+  const [pendingPaymentTxnId, setPendingPaymentTxnId] = useState('');
+
+  const fetchOrders = async () => {
+    try {
+      setLoading(true);
+      const token = sessionStorage.getItem('velqra_user_token');
+      
+      if (!token) {
+        const guestOrderToken = guestOrderId && sessionStorage.getItem(`velqra_guest_order_token_${guestOrderId}`);
+        if (!guestOrderToken) {
+          setError('Please login to view orders');
+          return;
+        }
+        const { data } = await axios.get(`${API_URL}/guest/orders/${encodeURIComponent(guestOrderId)}`, {
+          headers: { 'X-Guest-Order-Token': guestOrderToken }
+        });
+        if (!data.success || !data.order) throw new Error(data.message || 'Could not load guest order');
+        setOrders([data.order]);
+        setIsGuestOrder(true);
+        setError('');
+        return;
+      }
+
+      setIsGuestOrder(false);
+      const response = await axios.get(`${API_URL}/orders`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data.success) {
+        setOrders(response.data.orders || []);
+      }
+    } catch (err) {
+      setError('Failed to fetch orders');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handlePaymentStatusCheck = async (orderId, automatic = false) => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    const guestOrderToken = guestOrderId &&
+      sessionStorage.getItem(`velqra_guest_order_token_${guestOrderId}`);
+    if (!token && !guestOrderToken) {
+      onLoginRequest();
+      return;
+    }
+
+    const headers = token
+      ? { Authorization: `Bearer ${token}` }
+      : { 'X-Guest-Order-Token': guestOrderToken };
+    setPaymentCheckingId(orderId);
+    try {
+      const attempts = automatic ? 8 : 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const { data } = await axios.post(
+          `${API_URL}/orders/${orderId}/refresh-payment`,
+          {},
+          { headers }
+        );
+        if (!data.success || !data.order) {
+          throw new Error(data.message || 'Unable to refresh payment status');
+        }
+
+        setOrders(current => current.map(order =>
+          order._id === orderId ? data.order : order
+        ));
+
+        if (data.verified) {
+          window.alert('✅ PayU confirmed your payment. Your order status is updated.');
+          return;
+        }
+        if (data.order.status !== 'Payment Verification Pending') {
+          if (!automatic) {
+            window.alert(data.order.status === 'Payment Failed'
+              ? 'PayU reports that this payment failed. You can retry from the order.'
+              : `Payment status: ${data.order.status}`);
+          }
+          return;
+        }
+        if (attempt < attempts - 1) {
+          await new Promise(resolve => window.setTimeout(resolve, 5000));
+        }
+      }
+
+      window.alert('⏳ PayU is still confirming the payment. You can check again from My Orders.');
+    } catch (checkError) {
+      window.alert(checkError.response?.data?.message || checkError.message || 'Unable to refresh payment status');
+    } finally {
+      setPaymentCheckingId(null);
+    }
+  };
+
+  const handleInvoiceDownload = async orderId => {
+    setInvoiceLoadingId(orderId);
+    try {
+      await downloadOrderInvoice(orderId);
+    } catch (downloadError) {
+      window.alert(downloadError.message || 'Could not download invoice');
+    } finally {
+      setInvoiceLoadingId(null);
+    }
+  };
+
+  useEffect(() => {
+    fetchOrders();
+  }, []);
+
+    useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const paymentStatus = params.get('payment');
+    if (paymentStatus === 'success') {
+      alert('✅ Payment successful! Your order is confirmed.');
+      window.history.replaceState({}, '', guestOrderId
+        ? `/orders?guestOrder=${encodeURIComponent(guestOrderId)}`
+        : '/orders');
+      fetchOrders();
+    } else if (paymentStatus === 'failure') {
+      alert('❌ Payment failed. You can retry from the order details.');
+      window.history.replaceState({}, '', guestOrderId
+        ? `/orders?guestOrder=${encodeURIComponent(guestOrderId)}`
+        : '/orders');
+      fetchOrders();
+    } else if (paymentStatus === 'pending') {
+      alert('⏳ PayU is still confirming the payment. Your order will update after PayU confirms it.');
+      setPendingPaymentTxnId(params.get('txnid') || '');
+      window.history.replaceState({}, '', guestOrderId
+        ? `/orders?guestOrder=${encodeURIComponent(guestOrderId)}`
+        : '/orders');
+      fetchOrders();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pendingPaymentTxnId || loading) return;
+
+    const pendingOrder = orders.find(order => order.referenceId === pendingPaymentTxnId);
+    setPendingPaymentTxnId('');
+    if (pendingOrder?.status === 'Payment Verification Pending') {
+      void handlePaymentStatusCheck(pendingOrder._id, true);
+    }
+  }, [pendingPaymentTxnId, loading, orders]);
+
+
+  const getStatusBadge = (status, paymentMethod) => {
+    if (paymentMethod === 'cod') {
+      const styles = {
+        'Pending': 'bg-yellow-100 text-yellow-700',
+        'Confirmed': 'bg-blue-100 text-blue-700',
+        'Shipped': 'bg-purple-100 text-purple-700',
+        'Delivered': 'bg-green-100 text-green-700',
+        'Return Requested': 'bg-amber-100 text-amber-700',
+        'Cancelled': 'bg-red-100 text-red-700'
+      };
+      return styles[status] || 'bg-slate-100 text-slate-700';
+    } else {
+      const styles = {
+        'Payment Verification Pending': 'bg-orange-100 text-orange-700',
+        'Payment Verified': 'bg-green-100 text-green-700',
+        'Payment Failed': 'bg-red-100 text-red-700',
+        'Confirmed': 'bg-blue-100 text-blue-700',
+        'Shipped': 'bg-purple-100 text-purple-700',
+        'Delivered': 'bg-green-100 text-green-700',
+        'Return Requested': 'bg-amber-100 text-amber-700',
+        'Cancelled': 'bg-red-100 text-red-700'
+      };
+      return styles[status] || 'bg-slate-100 text-slate-700';
+    }
+  };
+
+  const getStatusDisplay = (status, paymentMethod) => {
+    return status;
+  };
+
+    const canCancelOrder = (order) => {
+    if (order.status === 'Delivered' || order.status === 'Cancelled') return false;
+    if (order.status === 'Shipped' || order.status === 'Confirmed' || order.status === 'Payment Verified') return false;
+    if (order.paymentMethod === 'cod' && order.status === 'Pending') return true;
+    if (order.paymentMethod === 'online' && (order.status === 'Payment Verification Pending' || order.status === 'Payment Failed')) return true;
+    return false;
+  };
+
+  const getDeliveredAt = (order) => {
+    const deliveredEntry = [...(order.statusHistory || [])]
+      .reverse()
+      .find((entry) => entry.status === 'Delivered');
+    return deliveredEntry?.timestamp ? new Date(deliveredEntry.timestamp) : new Date(order.updatedAt || order.createdAt);
+  };
+
+    // ✅ NAYA: COD return + online return dono ke liye (7-day window check)
+  const canRequestReturn = (order) => {
+    if (order.status !== 'Delivered') return false;
+    if (order.returnRequest) return false; // pehle se return hai
+    if (!order.createdAt) return false;
+    const deliveredAt = getDeliveredAt(order);
+    if (Number.isNaN(deliveredAt.getTime())) return false;
+    return Date.now() - deliveredAt.getTime() <= 7 * 24 * 60 * 60 * 1000;
+  };
+
+  // ✅ Modal open karne ke liye
+  const openReturnModal = (order) => {
+    setReturnModalOrder(order);
+  };
+
+  // ✅ Return request cancel karne ke liye (sirf Pending tak)
+  const handleCancelReturn = async (returnId) => {
+    if (!window.confirm('Return cancel karna hai? Ye action undo nahi hoga.')) return;
+    const token = sessionStorage.getItem('velqra_user_token');
+    try {
+      setLoading(true);
+      const res = await axios.patch(
+        `${API_URL}/returns/${returnId}/cancel`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.data.success) {
+        alert('✅ Return cancelled successfully');
+        fetchOrders();
+      }
+    } catch (err) {
+      alert(err.response?.data?.message || 'Failed to cancel return');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCancelOrder = async (orderId) => {
+    if (!window.confirm('Are you sure you want to cancel this order?')) return;
+    
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (!token) {
+      alert('Please login to cancel order');
+      return;
+    }
+    
+    try {
+      setLoading(true);
+      const response = await axios.patch(
+        `${API_URL}/orders/${orderId}/cancel`,
+        {},
+        { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+      );
+      
+      if (response.data.success) {
+        setOrders(prev => prev.map(order => 
+          order._id === orderId ? { ...order, status: 'Cancelled' } : order
+        ));
+        alert('✅ Order cancelled successfully!');
+        fetchOrders();
+      } else {
+        alert(response.data.message || 'Failed to cancel order');
+      }
+    } catch (err) {
+      alert(err.response?.data?.message || 'Failed to cancel order');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="container mx-auto px-4 py-12 text-center">
+        <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-[#0B3C5D]"></div>
+        <p className="text-slate-400 mt-4">{t('Loading your orders...')}</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="container mx-auto px-4 py-12 text-center">
+        <div className="text-6xl mb-4">🔒</div>
+        <p className="text-red-500 font-bold">{error}</p>
+        <button 
+          onClick={onLoginRequest}
+          className="mt-4 inline-block bg-[#0B3C5D] text-white px-6 py-2.5 rounded-xl text-sm font-bold hover:bg-[#07263b] transition"
+        >
+          {t('Login to view orders')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container mx-auto max-w-4xl px-4 py-8">
+      <div className="flex items-center justify-between mb-8">
+        <h1 className="text-2xl font-black text-slate-800 flex items-center gap-2">
+          <span>📦</span> {t('My Orders')}
+        </h1>
+        <Link to="/" className="text-sm text-[#0B3C5D] font-bold hover:underline">
+          ← {t('Continue Shopping')}
+        </Link>
+      </div>
+
+      {orders.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center shadow-sm">
+          <div className="text-6xl mb-4">🛍️</div>
+          <h3 className="font-bold text-lg text-slate-700">{t('No orders yet')}</h3>
+          <p className="text-slate-400 text-sm mt-2">{t('Start shopping to place your first order!')}</p>
+          <Link to="/" className="mt-4 inline-block bg-[#FF5722] text-white px-6 py-2.5 rounded-xl text-sm font-bold hover:bg-[#e64a19] transition">
+            {t('Browse Products')}
+          </Link>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {orders.map((order) => {
+            const isCOD = order.paymentMethod === 'cod';
+            const wasDelivered = order.status === 'Delivered' ||
+              (order.statusHistory || []).some(entry => entry?.status === 'Delivered');
+            const statusDisplay = getStatusDisplay(order.status, order.paymentMethod);
+            const statusBadgeClass = getStatusBadge(order.status, order.paymentMethod);
+            const isCancellable = canCancelOrder(order);
+            const invoiceAvailable = order.status === 'Delivered' ||
+              (order.statusHistory || []).some(entry => entry?.status === 'Delivered');
+            
+            return (
+              <div key={order._id} className="bg-white rounded-2xl border border-slate-200 shadow-sm hover:shadow-md transition p-6">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span className="font-mono text-sm font-bold text-slate-600">
+                        #{order._id.slice(-8).toUpperCase()}
+                      </span>
+                      <span className={`text-xs font-bold px-3 py-1 rounded-full ${statusBadgeClass}`}>
+                        {t(statusDisplay)}
+                      </span>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isCOD ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
+                        {isCOD ? `💵 ${t('Cash on Delivery')}` : `📱 ${t('Online Payment')}`}
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        {new Date(order.createdAt).toLocaleDateString(language === 'en' ? 'en-IN' : `${language}-IN`, {
+                          day: 'numeric',
+                          month: 'short',
+                          year: 'numeric'
+                        })}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-4 text-sm">
+                      <span className="text-slate-600">{order.items?.length || 0} {t((order.items?.length || 0) === 1 ? 'item' : 'items')}</span>
+                      <span className="text-slate-300">|</span>
+                      <span className="font-bold text-[#0B3C5D]">{formatCurrency(order.total)}</span>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {order.paymentMethod === 'online' &&
+                      order.status === 'Payment Verification Pending' && (
+                        <button
+                          type="button"
+                          onClick={() => handlePaymentStatusCheck(order._id)}
+                          disabled={paymentCheckingId === order._id}
+                          className="rounded-xl bg-amber-50 px-4 py-2 text-sm font-bold text-amber-700 transition hover:bg-amber-100 disabled:opacity-50"
+                        >
+                          {paymentCheckingId === order._id ? 'Checking payment...' : 'Check payment'}
+                        </button>
+                      )}
+                    {!isGuestOrder && (
+                      <Link to={`/orders/track/${order._id}`} className="bg-[#0B3C5D] text-white px-5 py-2 rounded-xl text-sm font-bold hover:bg-[#07263b] transition text-center whitespace-nowrap">
+                        {t('Track Order')} →
+                      </Link>
+                    )}
+                    {!isGuestOrder && invoiceAvailable && (
+                      <button
+                        type="button"
+                        onClick={() => handleInvoiceDownload(order._id)}
+                        disabled={invoiceLoadingId === order._id}
+                        className="bg-emerald-50 text-emerald-700 px-4 py-2 rounded-xl text-sm font-bold hover:bg-emerald-100 transition whitespace-nowrap disabled:opacity-50"
+                      >
+                        {invoiceLoadingId === order._id ? t('Preparing PDF...') : t('Download Invoice PDF')}
+                      </button>
+                    )}
+                    {!isGuestOrder && isCancellable && (
+                      <button onClick={() => handleCancelOrder(order._id)} className="bg-red-50 text-red-600 px-4 py-2 rounded-xl text-sm font-bold hover:bg-red-100 transition whitespace-nowrap">
+                        {t('Cancel Order')}
+                      </button>
+                    )}
+                    {!isGuestOrder && canRequestReturn(order) && (
+                      <button
+                        onClick={() => openReturnModal(order)}
+                        className="bg-emerald-50 text-emerald-700 px-4 py-2 rounded-xl text-sm font-bold hover:bg-emerald-100 transition whitespace-nowrap"
+                      >
+                        {t('Request Return')}
+                      </button>
+                    )}
+                    {order.returnRequest && (
+                      <span className="rounded-xl bg-amber-50 px-4 py-2 text-sm font-bold text-amber-700">
+                        Return: {order.returnRequest.status}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {order.items && order.items.length > 0 && (
+                  <div className="mt-4 pt-4 border-t border-slate-100">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {order.items.map((item, idx) => (
+                        <div key={idx} className="bg-slate-50 px-3 py-2 rounded-lg border border-slate-100 flex items-center gap-3">
+                          <img 
+                            src={item.image || getProductDisplayImage(item)} 
+                            alt={item.name}
+                            loading="lazy"
+                            decoding="async"
+                            className="w-10 h-10 object-cover rounded-lg border border-slate-200"
+                            onError={(e) => e.target.src = 'https://via.placeholder.com/40?text=Product'}
+                          />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-bold text-slate-700 truncate">{item.name}</p>
+                            {item.selectedAttributes && Object.keys(item.selectedAttributes).length > 0 && (
+                              <div className="text-[9px] text-slate-400 flex gap-1 flex-wrap">
+                                {Object.entries(item.selectedAttributes).map(([key, value]) => (
+                                  value && <span key={key}>{key}: {value}</span>
+                                ))}
+                              </div>
+                            )}
+                            <p className="text-[10px] text-slate-500">{formatCurrency(item.price)} × {item.qty}</p>
+                            {wasDelivered && !isGuestOrder && onOpenReviews &&
+                              (item.product_id || item.productId || item._id || item.id) && (
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenReviews({
+                                    ...item,
+                                    _id: item.product_id || item.productId || item._id || item.id
+                                  })}
+                                  className="mt-1 text-xs font-bold text-[#173b32] underline underline-offset-2 hover:text-[#0B3C5D]"
+                                >
+                                  {t('Write a review')}
+                                </button>
+                              )}
+                          </div>
+                          <span className="text-xs font-bold text-[#0B3C5D]">{formatCurrency(item.price * item.qty)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <ReturnRequestModal
+        isOpen={Boolean(returnModalOrder)}
+        onClose={() => setReturnModalOrder(null)}
+        order={returnModalOrder}
+        onSuccess={(returnRequest) => {
+          setOrders(prev => prev.map(order => order._id === returnRequest.orderId
+            ? { ...order, returnRequest }
+            : order
+          ));
+        }}
+      />
+    </div>
+  );
+};
+
+// =============================================
+// ORDER TRACKING
+// =============================================
+const OrderTracking = () => {
+  const { t, formatCurrency, language } = useLocalization();
+  const { orderId } = useParams();
+  const [tracking, setTracking] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const fetchOrderTracking = async () => {
+    try {
+      setLoading(true);
+      const token = sessionStorage.getItem('velqra_user_token');
+      
+      const response = await axios.get(
+        `${API_URL}/orders/${orderId}/tracking`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      if (response.data.success) {
+        setTracking(response.data.tracking);
+      } else {
+        setError('Failed to fetch order details');
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to fetch order tracking');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchOrderTracking();
+  }, [orderId]);
+
+  const getStatusBadge = (status) => {
+    const styles = {
+      'Order Placed': 'bg-orange-100 text-orange-700',
+      'Payment Verification Pending': 'bg-yellow-100 text-yellow-700',
+      'Order Confirmed': 'bg-yellow-100 text-yellow-700',
+      'Confirmed': 'bg-yellow-100 text-yellow-700',
+      'Payment Verified': 'bg-green-100 text-green-700',
+      'Shipped': 'bg-blue-100 text-blue-700',
+      'Delivered': 'bg-green-100 text-green-700',
+      'Cancelled': 'bg-red-100 text-red-700'
+    };
+    return styles[status] || 'bg-slate-100 text-slate-700';
+  };
+
+  if (loading) {
+    return (
+      <div className="container mx-auto px-4 py-20 text-center">
+        <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-[#0B3C5D]"></div>
+        <p className="text-slate-400 mt-4 font-medium">{t('Loading order details...')}</p>
+      </div>
+    );
+  }
+
+  if (error || !tracking) {
+    return (
+      <div className="container mx-auto px-4 py-20 text-center">
+        <div className="text-6xl mb-4">🔍</div>
+        <h3 className="text-red-500 font-bold text-lg">{t(error || 'Order not found')}</h3>
+        <Link to="/orders" className="mt-4 inline-block bg-[#0B3C5D] text-white px-6 py-2.5 rounded-xl text-sm font-bold hover:bg-[#07263b] transition">
+          ← {t('Back to Orders')}
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container mx-auto max-w-4xl px-4 py-8">
+      <div className="bg-gradient-to-r from-[#0B3C5D] to-[#1a6496] text-white p-6 rounded-2xl shadow-lg mb-6">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-2xl font-black flex items-center gap-2">
+              <span>📦</span> {t('Order Tracking')}
+            </h2>
+            <p className="text-sm opacity-80 mt-1 font-mono">
+              {t('Order ID:')} #{tracking.orderId?.slice(-8).toUpperCase()}
+            </p>
+            <p className="text-xs opacity-70 mt-1">
+              {t('Placed')}: {new Date(tracking.createdAt).toLocaleDateString(language === 'en' ? 'en-IN' : `${language}-IN`, {
+                day: 'numeric',
+                month: 'long',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+              })}
+            </p>
+          </div>
+          <div className="flex items-center gap-2 bg-white/10 px-4 py-2 rounded-full">
+            <span className="text-xs font-bold uppercase tracking-wider">{t('Status:')}</span>
+            <span className={`text-xs font-bold px-3 py-1 rounded-full ${getStatusBadge(tracking.currentStatus)}`}>
+              {t(tracking.currentStatus)}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow-md p-6 mb-6 border border-slate-100">
+        <h3 className="font-bold text-lg text-slate-800 mb-6 flex items-center gap-2">
+          <span>🚚</span> {t('Delivery Timeline')}
+        </h3>
+        <div className="space-y-6 relative">
+          {tracking.timeline?.map((step, index) => (
+            <div key={index} className="flex gap-4 relative">
+              {index < tracking.timeline.length - 1 && (
+                <div className={`absolute left-5 top-10 w-0.5 h-12 ${step.completed ? 'bg-green-500' : 'bg-slate-200'}`} />
+              )}
+              <div className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-xl border-2 ${step.completed ? 'bg-green-100 border-green-500' : 'bg-slate-100 border-slate-300'}`}>
+                {step.icon}
+              </div>
+              <div className="flex-1 pt-0.5">
+                <div className={`font-bold text-sm ${step.completed ? 'text-slate-800' : 'text-slate-400'}`}>
+                  {t(step.status)}
+                </div>
+                <div className={`text-xs ${step.completed ? 'text-slate-600' : 'text-slate-400'}`}>
+                  {t(step.description)}
+                </div>
+                {step.timestamp && (
+                  <div className="text-[10px] text-slate-400 mt-1">
+                    {new Date(step.timestamp).toLocaleString(language === 'en' ? 'en-IN' : `${language}-IN`, {
+                      day: 'numeric',
+                      month: 'short',
+                      hour: '2-digit',
+                      minute: '2-digit'
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow-md p-6 mb-6 border border-slate-100">
+        <h3 className="font-bold text-lg text-slate-800 mb-4 flex items-center gap-2">
+          <span>📋</span> {t('Order Summary')}
+        </h3>
+        <div className="space-y-2">
+          {tracking.items?.map((item, index) => (
+            <div key={index} className="flex items-center justify-between py-2 border-b border-slate-100 text-sm">
+              <div className="flex items-center gap-3 flex-1">
+                <img 
+                  src={getProductDisplayImage(item)} 
+                  alt={item.name}
+                  loading="lazy"
+                  decoding="async"
+                  className="w-10 h-10 object-cover rounded-lg border border-slate-200"
+                  onError={(e) => e.target.src = 'https://via.placeholder.com/40'}
+                />
+                <span className="font-medium text-slate-700 flex-1">{item.name}</span>
+              </div>
+              <div className="flex items-center gap-4">
+                <span className="text-slate-400 text-xs">×{item.qty}</span>
+                <span className="font-bold text-[#0B3C5D]">{formatCurrency(item.price * item.qty)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 pt-4 border-t-2 border-slate-200 flex justify-between items-center">
+          <span className="font-bold text-slate-600">{t('Total')}</span>
+          <span className="text-xl font-black text-[#0B3C5D]">{formatCurrency(tracking.total)}</span>
+        </div>
+      </div>
+
+      {tracking.delivery && (
+        <div className="bg-white rounded-2xl shadow-md p-6 mb-6 border border-slate-100">
+          <h4 className="font-bold text-sm text-slate-700 mb-3 flex items-center gap-2">
+            <span>📬</span> {t('Delivery Address')}
+          </h4>
+          <div className="bg-slate-50 p-4 rounded-xl text-sm text-slate-600 space-y-1">
+            <p className="font-bold text-slate-700">{tracking.delivery.fullName}</p>
+            <p>{tracking.delivery.address}</p>
+            <p>{tracking.delivery.city}, {tracking.delivery.state} - {tracking.delivery.pincode}</p>
+            <p className="text-xs text-slate-400">📞 {tracking.delivery.phone}</p>
+            {tracking.delivery.note && (
+              <p className="text-xs text-slate-400 mt-1">📝 {t('Note:')} {tracking.delivery.note}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-4 justify-center">
+        <Link to="/orders" className="bg-slate-100 text-slate-700 px-6 py-2.5 rounded-xl font-bold text-sm hover:bg-slate-200 transition">
+          ← {t('Back to Orders')}
+        </Link>
+        {tracking.currentStatus !== 'Delivered' && tracking.currentStatus !== 'Cancelled' && (
+          <button 
+            onClick={fetchOrderTracking}
+            className="bg-[#0B3C5D] text-white px-6 py-2.5 rounded-xl font-bold text-sm hover:bg-[#07263b] transition flex items-center gap-2"
+          >
+            <span>🔄</span> {t('Refresh Status')}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const routineSteps = [
+  {
+    question: 'What is your skin type?',
+    options: ['Oily', 'Dry', 'Combination', 'Sensitive'],
+    metadataKeys: ['skinType', 'skin_type', 'skinTypes', 'skin_types']
+  },
+  {
+    question: 'What is your primary concern?',
+    options: ['Uneven tone', 'Dryness', 'Texture', 'Sensitivity'],
+    metadataKeys: ['skinConcern', 'skin_concern', 'concerns', 'primaryConcern', 'primary_concern']
+  },
+  {
+    question: 'What is your routine goal?',
+    options: ['Balance', 'Hydrate', 'Brighten', 'Clarify'],
+    metadataKeys: ['routineGoal', 'routine_goal', 'goals', 'benefits']
+  }
+];
+
+const routineOptionTerms = {
+  Oily: ['oily', 'oil control'],
+  Dry: ['dry', 'dry skin'],
+  Combination: ['combination', 'combination skin'],
+  Sensitive: ['sensitive', 'sensitivity'],
+  'Uneven tone': ['uneven tone', 'uneven skin tone'],
+  Dryness: ['dryness', 'dry'],
+  Texture: ['texture', 'skin texture'],
+  Sensitivity: ['sensitivity', 'sensitive'],
+  Balance: ['balance', 'balancing'],
+  Hydrate: ['hydrate', 'hydration', 'moisturize', 'moisturise'],
+  Brighten: ['brighten', 'brightening'],
+  Clarify: ['clarify', 'clarifying']
+};
+
+const RoutineFinder = ({ products, t, formatCurrency, animationCycle = 0 }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [stepIndex, setStepIndex] = useState(0);
+  const [selections, setSelections] = useState([]);
+  const completed = selections.length === routineSteps.length;
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const handleKeyDown = event => {
+      if (event.key === 'Escape') setIsOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isOpen]);
+
+  const matchingProducts = completed
+    ? products.filter(product => routineSteps.every((step, index) => {
+      const metadata = getProductMetadata(product, step.metadataKeys);
+      const searchableText = [
+        getSearchableProductText(product),
+        product.description || '',
+        metadata
+      ].join(' ').toLowerCase();
+      const terms = routineOptionTerms[selections[index]] || [selections[index].toLowerCase()];
+      return terms.some(term => searchableText.includes(term));
+    }))
+    : [];
+
+  const resetFinder = () => {
+    setStepIndex(0);
+    setSelections([]);
+  };
+
+  return (
+    <>
+      <button
+        key={animationCycle}
+        type="button"
+        className={`velqra-routine-trigger${animationCycle > 0 ? ' is-visible' : ''}`}
+        onClick={() => setIsOpen(true)}
+      >
+        {t('Find Your Product')}
+      </button>
+      {isOpen && createPortal(
+        <div className="velqra-finder-backdrop" onMouseDown={event => {
+          if (event.target === event.currentTarget) setIsOpen(false);
+        }}>
+          <section className="velqra-finder-modal" role="dialog" aria-modal="true" aria-labelledby="routine-finder-title">
+            <button type="button" className="velqra-finder-close" aria-label={t('Close')} onClick={() => setIsOpen(false)}>×</button>
+            <p className="velqra-finder-eyebrow">{t('A considered routine')}</p>
+            <h2 id="routine-finder-title">{t('Find your skin routine')}</h2>
+            <div className="velqra-finder-progress" aria-hidden="true">
+              <span style={{ width: `${completed ? 100 : ((stepIndex + 1) / routineSteps.length) * 100}%` }} />
+            </div>
+            {completed ? (
+              <>
+                <p className="velqra-finder-step">{t('Selected for your preferences')}</p>
+                {matchingProducts.length > 0 ? (
+                  <div className="velqra-finder-results">
+                    {matchingProducts.map(product => (
+                      <Link key={product._id} to={`/product/${product._id}`} onClick={() => setIsOpen(false)}>
+                        <img src={getProductDisplayImage(product)} alt="" loading="lazy" />
+                        <span>{product.name}</span>
+                        <strong>{formatCurrency(product.price)}</strong>
+                      </Link>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="velqra-finder-empty">
+                    {t('No exact match in the current collection. Browse the products to explore the full range.')}
+                  </p>
+                )}
+                <button type="button" className="velqra-finder-back" onClick={resetFinder}>{t('Start again')}</button>
+              </>
+            ) : (
+              <>
+                <p className="velqra-finder-step">{t('Step {step} of {total}', { step: stepIndex + 1, total: routineSteps.length })}</p>
+                <h3>{t(routineSteps[stepIndex].question)}</h3>
+                <div className="velqra-finder-options">
+                  {routineSteps[stepIndex].options.map(option => (
+                    <button
+                      type="button"
+                      key={option}
+                      aria-pressed={selections[stepIndex] === option}
+                      onClick={() => setSelections(current => {
+                        const next = current.slice(0, stepIndex);
+                        next[stepIndex] = option;
+                        return next;
+                      })}
+                    >
+                      {t(option)}
+                    </button>
+                  ))}
+                </div>
+                {stepIndex > 0 && (
+                  <button type="button" className="velqra-finder-back" onClick={() => setStepIndex(current => current - 1)}>
+                    {t('Back')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="velqra-finder-next"
+                  disabled={!selections[stepIndex]}
+                  onClick={() => {
+                    if (stepIndex === routineSteps.length - 1) {
+                      setSelections(current => current.slice(0, routineSteps.length));
+                    } else {
+                      setStepIndex(current => current + 1);
+                    }
+                  }}
+                >
+                  {stepIndex === routineSteps.length - 1 ? t('Find your routine') : t('Continue')}
+                </button>
+              </>
+            )}
+          </section>
+        </div>,
+        document.body
+      )}
+    </>
+  );
+};
+
+// =============================================
+// MAIN APP COMPONENT
+// =============================================
+export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [language, setLanguage] = useState(() => {
+    const stored = localStorage.getItem('velqra_language');
+    return LANGUAGE_OPTIONS.some(option => option.value === stored) ? stored : 'en';
+  });
+  const [currency, setCurrency] = useState(() => {
+    const stored = localStorage.getItem('velqra_currency');
+    return CURRENCY_OPTIONS.some(option => option.value === stored) ? stored : 'INR';
+  });
+  const [initialExchangeRates] = useState(getCachedExchangeRates);
+  const [exchangeRates, setExchangeRates] = useState(initialExchangeRates.rates);
+  const [exchangeRateDate, setExchangeRateDate] = useState(initialExchangeRates.date);
+  const [exchangeRateStatus, setExchangeRateStatus] = useState('loading');
+  const formatPrice = amount => formatMoney(amount, language, currency, exchangeRates);
+  const t = (key, values) => translate(language, key, values);
+  const localization = { language, currency, rates: exchangeRates, t, formatCurrency: formatPrice };
+  const [products, setProducts] = useState(getCachedProducts);
+  const [catalogLoading, setCatalogLoading] = useState(() => getCachedProducts().length === 0);
+  const [catalogError, setCatalogError] = useState('');
+  const productFetchInProgress = useRef(false);
+  const [heroVideoCycle, setHeroVideoCycle] = useState(0);
+  const heroVideoReachedEndRef = useRef(false);
+  const [activeReviewsProduct, setActiveReviewsProduct] = useState(null);
+  const [pendingReviewProduct, setPendingReviewProduct] = useState(null);
+  const [productStockDrafts, setProductStockDrafts] = useState({});
+  const [stockUpdatingId, setStockUpdatingId] = useState(null);
+  const [cart, setCart] = useState([]);
+  const cartMutationQueue = useRef(Promise.resolve());
+  const cartOpenRef = useRef(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isHeaderSearchOpen, setIsHeaderSearchOpen] = useState(false);
+  const [isCartOpen, setIsCartOpen] = useState(false);
+  const [activeCategory, setActiveCategory] = useState('All');
+  const [loading, setLoading] = useState(false);
+  const [cartLoading, setCartLoading] = useState(false);
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+  const [placingOrder, setPlacingOrder] = useState(false);
+  const [orderSubmitError, setOrderSubmitError] = useState('');
+  const [marketingConsent, setMarketingConsent] = useState(false);
+  const [error, setError] = useState('');
+  const [isHeaderScrolled, setIsHeaderScrolled] = useState(false);
+
+  useEffect(() => {
+    captureTrafficAttribution(location.search, location.pathname);
+  }, [location.pathname, location.search]);
+
+  useEffect(() => {
+    if (location.pathname !== '/' || location.hash !== '#products') return undefined;
+
+    const frameId = window.requestAnimationFrame(() => {
+      document.getElementById('products')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [location.pathname, location.hash]);
+
+  useEffect(() => {
+    localStorage.setItem('velqra_language', language);
+  }, [language]);
+
+  useEffect(() => {
+    localStorage.setItem('velqra_currency', currency);
+  }, [currency]);
+
+  useEffect(() => {
+    if (currency === 'INR') {
+      setExchangeRateStatus('ready');
+      return undefined;
+    }
+
+    let active = true;
+    const loadExchangeRates = async () => {
+      try {
+        const quotes = CURRENCY_OPTIONS
+          .filter(option => option.value !== 'INR')
+          .map(option => option.value)
+          .join(',');
+        const response = await fetch(`${EXCHANGE_RATE_API_URL}?base=INR&quotes=${quotes}`);
+        if (!response.ok) throw new Error('Exchange-rate request failed');
+
+        const entries = await response.json();
+        if (!Array.isArray(entries)) throw new Error('Invalid exchange-rate response');
+
+        const nextRates = { INR: 1 };
+        entries.forEach(entry => {
+          if (CURRENCY_OPTIONS.some(option => option.value === entry.quote) &&
+              Number.isFinite(Number(entry.rate)) && Number(entry.rate) > 0) {
+            nextRates[entry.quote] = Number(entry.rate);
+          }
+        });
+
+        if (!active) return;
+        const hasMissingRates = CURRENCY_OPTIONS.some(option => !nextRates[option.value]);
+        const latestDate = entries[0]?.date || '';
+        setExchangeRates(nextRates);
+        setExchangeRateDate(latestDate);
+        setExchangeRateStatus(hasMissingRates ? 'partial' : 'ready');
+        localStorage.setItem(EXCHANGE_RATES_CACHE_KEY, JSON.stringify({
+          rates: nextRates,
+          date: latestDate
+        }));
+      } catch {
+        if (active) {
+          const hasCachedForeignRates = Object.keys(initialExchangeRates.rates)
+            .some(code => code !== 'INR');
+          setExchangeRateStatus(hasCachedForeignRates ? 'stale' : 'error');
+        }
+      }
+    };
+
+    loadExchangeRates();
+    const refreshTimer = window.setInterval(loadExchangeRates, 6 * 60 * 60 * 1000);
+    return () => {
+      active = false;
+      window.clearInterval(refreshTimer);
+    };
+  }, [currency]);
+
+  // Auth States
+  const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(() => {
+    const user = getSessionUser();
+    return sessionStorage.getItem('velqra_admin') === 'true' && user?.role === 'admin';
+  });
+  const [loginPassword, setLoginPassword] = useState('');
+  const [registerName, setRegisterName] = useState('');
+  const [registerEmail, setRegisterEmail] = useState('');
+  const [registerPassword, setRegisterPassword] = useState('');
+
+  const [isUserLoggedIn, setIsUserLoggedIn] = useState(() => {
+    return Boolean(sessionStorage.getItem('velqra_user_token'));
+  });
+  const [currentUser, setCurrentUser] = useState(() => {
+    return getSessionUser();
+  });
+  const [userAuthMode, setUserAuthMode] = useState('login');
+
+  const openCart = () => {
+    if (cartOpenRef.current) return;
+    cartOpenRef.current = true;
+    setIsHeaderSearchOpen(false);
+    setIsMobileMenuOpen(false);
+    navigate(`${location.pathname}${location.search}${location.hash}`, {
+      state: { ...(location.state || {}), velqraCartOpen: true }
+    });
+    setIsCartOpen(true);
+  };
+
+  const closeCart = () => {
+    if (!cartOpenRef.current) return;
+    cartOpenRef.current = false;
+    setIsCartOpen(false);
+    setCheckoutOpen(false);
+    if (location.state?.velqraCartOpen) navigate(-1);
+  };
+
+  useEffect(() => {
+    const cartEntryIsOpen = Boolean(location.state?.velqraCartOpen);
+    cartOpenRef.current = cartEntryIsOpen;
+    setIsCartOpen(cartEntryIsOpen);
+    if (!cartEntryIsOpen) setCheckoutOpen(false);
+  }, [location.state]);
+
+  useEffect(() => {
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    setIsHeaderSearchOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!isCartOpen) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isCartOpen]);
+
+  useEffect(() => {
+    const revealElements = document.querySelectorAll('[data-reveal]');
+    const revealAll = () => revealElements.forEach(element => {
+      element.classList.add('is-visible');
+      element.classList.remove('reveal-ready');
+    });
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches ||
+        !('IntersectionObserver' in window)) {
+      revealAll();
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('is-visible');
+          entry.target.classList.remove('reveal-ready');
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.08 });
+
+    const observeRevealElement = element => {
+      if (!(element instanceof HTMLElement) || !element.matches('[data-reveal]') ||
+          element.classList.contains('reveal-ready') || element.classList.contains('is-visible')) return;
+      element.classList.add('reveal-ready');
+      const bounds = element.getBoundingClientRect();
+      if (bounds.top < window.innerHeight && bounds.bottom > 0) {
+        element.classList.add('is-visible');
+        element.classList.remove('reveal-ready');
+      } else {
+        observer.observe(element);
+      }
+    };
+
+    revealElements.forEach(observeRevealElement);
+    const mutationObserver = new MutationObserver(mutations => {
+      mutations.forEach(mutation => mutation.addedNodes.forEach(node => {
+        if (!(node instanceof HTMLElement)) return;
+        observeRevealElement(node);
+        node.querySelectorAll('[data-reveal]').forEach(observeRevealElement);
+      }));
+    });
+    mutationObserver.observe(document.body, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      mutationObserver.disconnect();
+    };
+  }, [location.pathname, products.length, searchQuery, activeCategory, language]);
+
+  useEffect(() => {
+    const syncUserAuthState = () => {
+      setIsUserLoggedIn(Boolean(sessionStorage.getItem('velqra_user_token')));
+      setCurrentUser(getSessionUser());
+    };
+
+    window.addEventListener('velqra-auth-change', syncUserAuthState);
+    window.addEventListener('storage', syncUserAuthState);
+
+    return () => {
+      window.removeEventListener('velqra-auth-change', syncUserAuthState);
+      window.removeEventListener('storage', syncUserAuthState);
+    };
+  }, []);
+
+  useEffect(() => {
+    ['velqra_user', 'velqra_user_token', 'velqra_token', 'velqra_admin', 'velqra_cart'].forEach(key => {
+      localStorage.removeItem(key);
+    });
+  }, []);
+
+  // Registration Fields
+  const [regName, setRegName] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regPhone, setRegPhone] = useState('');
+  const [regPassword, setRegPassword] = useState('');
+  const [regConfirmPassword, setRegConfirmPassword] = useState('');
+  const [regStep, setRegStep] = useState('form');
+  const [regSmsOtp, setRegSmsOtp] = useState('');
+  const [regTimer, setRegTimer] = useState(0);
+  const [regResendDisabled, setRegResendDisabled] = useState(false);
+
+  // Login Fields
+  const [userEmail, setUserEmail] = useState('');
+  const [userPassword, setUserPassword] = useState('');
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isMobilePoliciesOpen, setIsMobilePoliciesOpen] = useState(false);
+  const [isMobileSocialOpen, setIsMobileSocialOpen] = useState(false);
+
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(() => {
+    return false;
+  });
+  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
+  const isUserAuthPage = location.pathname === '/login' || location.pathname === '/register';
+  const openUserAuth = (mode = 'login') => {
+    setError('');
+    setUserAuthMode(mode);
+    setIsAuthModalOpen(true);
+    setIsForgotPasswordOpen(false);
+    if (mode === 'register') setRegStep('form');
+    navigate(mode === 'register' ? '/register' : '/login');
+  };
+
+  useEffect(() => {
+    if (!isUserAuthPage) return;
+
+    setUserAuthMode(location.pathname === '/register' ? 'register' : 'login');
+    setIsAuthModalOpen(true);
+  }, [isUserAuthPage, location.pathname]);
+
+  useEffect(() => {
+    if (!isUserAuthPage) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isUserAuthPage]);
+
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [registeredPhoneLoading, setRegisteredPhoneLoading] = useState(false);
+  const [savedAddressLookupStatus, setSavedAddressLookupStatus] = useState('');
+  const savedAddressLookupRef = useRef('');
+  const [pincodeLookupStatus, setPincodeLookupStatus] = useState('');
+  const pincodeLookupRef = useRef('');
+  const [pincodeLookupAttempt, setPincodeLookupAttempt] = useState(0);
+  const [isOrderOTPModalOpen, setIsOrderOTPModalOpen] = useState(false);
+  const [pendingOrderData, setPendingOrderData] = useState(null);
+  const [paymentMethod, setPaymentMethod] = useState('cod');
+  const [deliveryForm, setDeliveryForm] = useState({
+    fullName: '',
+    phone: '',
+    alternatePhone: '',
+    email: '',
+    address: '',
+    landmark: '',
+    city: '',
+    state: '',
+    pincode: '',
+    district: '',
+    country: DEFAULT_COUNTRY.name,
+    countryCode: DEFAULT_COUNTRY.isoCode,
+    note: ''
+  });
+  const selectedCountry = COUNTRIES.find(country => country.isoCode === deliveryForm.countryCode) || DEFAULT_COUNTRY;
+  const countryStates = State.getStatesOfCountry(selectedCountry.isoCode);
+  const deliveryPhone = formatInternationalPhone(deliveryForm.phone, selectedCountry);
+
+  useEffect(() => {
+    const pincode = String(deliveryForm.pincode || '').trim();
+    if (!checkoutOpen || selectedCountry.isoCode !== 'IN' || !/^\d{6}$/.test(pincode)) {
+      setPincodeLookupStatus('');
+      return undefined;
+    }
+
+    if (pincodeLookupRef.current === pincode) return undefined;
+    let active = true;
+    setPincodeLookupStatus('loading');
+    const timeout = setTimeout(async () => {
+      try {
+        const { data } = await axios.get(`${API_URL}/location/pincode/${encodeURIComponent(pincode)}`);
+        if (!active) return;
+        pincodeLookupRef.current = pincode;
+        if (!data.success || !data.location) {
+          setPincodeLookupStatus('not-found');
+          return;
+        }
+
+        const location = data.location;
+        const normalizedState = String(location.state || '').trim().toLowerCase().replace(/^nct of /, '');
+        const matchingState = State.getStatesOfCountry('IN').find(state =>
+          state.name.toLowerCase().replace(/^nct of /, '') === normalizedState
+        );
+        setDeliveryForm(prev => {
+          if (prev.pincode.trim() !== pincode || prev.countryCode !== 'IN') return prev;
+          return {
+            ...prev,
+            city: location.city || prev.city,
+            district: location.district || prev.district,
+            state: matchingState?.name || location.state || prev.state,
+            country: location.country || 'India',
+            countryCode: location.countryCode || 'IN'
+          };
+        });
+        setPincodeLookupStatus('found');
+      } catch (error) {
+        if (active) {
+          setPincodeLookupStatus(error.response?.status === 404 ? 'not-found' : 'error');
+        }
+      }
+    }, 350);
+
+    return () => {
+      active = false;
+      clearTimeout(timeout);
+    };
+  }, [checkoutOpen, deliveryForm.pincode, selectedCountry.isoCode, pincodeLookupAttempt]);
+
+  useEffect(() => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    const pincode = String(deliveryForm.pincode || '').trim();
+    const validPincode = selectedCountry.isoCode === 'IN'
+      ? /^\d{6}$/.test(pincode)
+      : /^[A-Za-z0-9][A-Za-z0-9 -]{1,10}[A-Za-z0-9]$/.test(pincode);
+
+    if (!checkoutOpen || !token || currentUser?.role === 'admin' || !deliveryPhone || !validPincode) {
+      setSavedAddressLookupStatus('');
+      return undefined;
+    }
+
+    const lookupKey = `${deliveryPhone}:${selectedCountry.isoCode}:${pincode}`;
+    if (savedAddressLookupRef.current === lookupKey) return undefined;
+
+    let active = true;
+    setSavedAddressLookupStatus('loading');
+    const timeout = setTimeout(async () => {
+      try {
+        const { data } = await axios.post(
+          `${API_URL}/orders/saved-address`,
+          { phone: deliveryPhone, pincode, countryCode: selectedCountry.isoCode },
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!active) return;
+        savedAddressLookupRef.current = lookupKey;
+        if (data.success && data.delivery) {
+          setDeliveryForm(prev => {
+            if (prev.pincode.trim() !== pincode ||
+                formatInternationalPhone(prev.phone, selectedCountry) !== deliveryPhone) return prev;
+            return {
+              ...prev,
+              fullName: prev.fullName || data.delivery.fullName,
+              address: prev.address || data.delivery.address,
+              landmark: prev.landmark || data.delivery.landmark,
+              city: prev.city || data.delivery.city,
+              district: prev.district || data.delivery.district,
+              state: prev.state || data.delivery.state
+            };
+          });
+          setSavedAddressLookupStatus('found');
+        } else {
+          setSavedAddressLookupStatus('');
+        }
+      } catch {
+        if (active) setSavedAddressLookupStatus('error');
+      }
+    }, 400);
+
+    return () => {
+      active = false;
+      clearTimeout(timeout);
+    };
+  }, [
+    checkoutOpen,
+    deliveryPhone,
+    deliveryForm.pincode,
+    selectedCountry.isoCode,
+    currentUser?.role
+  ]);
+
+  useEffect(() => {
+    if (checkoutOpen) {
+      const registeredPhone = getRegisteredPhone(currentUser);
+      setDeliveryForm(prev => ({
+        ...prev,
+        phone: registeredPhone || prev.phone
+      }));
+    }
+  }, [checkoutOpen, currentUser?.phone]);
+
+  useEffect(() => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (!checkoutOpen || !token || currentUser?.role === 'admin') return;
+
+    let active = true;
+    setRegisteredPhoneLoading(true);
+    axios.get(`${AUTH_URL}/verify`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }).then(({ data }) => {
+      if (!active || !data.success) return;
+      setCurrentUser(data.user);
+      setDeliveryForm(prev => ({
+        ...prev,
+        phone: getRegisteredPhone(data.user) || prev.phone
+      }));
+      sessionStorage.setItem('velqra_user', JSON.stringify(data.user));
+    }).catch(() => {
+      if (active) showToast('Could not load your registered phone number. Please sign in again.', 'error');
+    }).finally(() => {
+      if (active) setRegisteredPhoneLoading(false);
+    });
+
+    return () => {
+      active = false;
+      setRegisteredPhoneLoading(false);
+    };
+  }, [checkoutOpen, currentUser?.role]);
+  const [orders, setOrders] = useState([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [returnRequests, setReturnRequests] = useState([]);
+  const [returnsLoading, setReturnsLoading] = useState(false);
+  const [verifyingPaymentId, setVerifyingPaymentId] = useState(null);
+  const [updatingReturnId, setUpdatingReturnId] = useState(null);
+
+  const updateProductReviewSummary = (productId, summary) => {
+    if (summary.rating === null || summary.reviewsCount === null) return;
+    setProducts(currentProducts => {
+      const updatedProducts = currentProducts.map(product =>
+        String(product._id || product.id) === String(productId)
+          ? {
+              ...product,
+              rating: summary.rating,
+              reviewsCount: summary.reviewsCount,
+              reviews_count: summary.reviewsCount
+            }
+          : product
+      );
+      localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(updatedProducts));
+      return updatedProducts;
+    });
+  };
+
+  // Product Management States
+  const [newProdName, setNewProdName] = useState('');
+  const [newProdOriginalPrice, setNewProdOriginalPrice] = useState('');
+  const [newProdDiscount, setNewProdDiscount] = useState('0');
+  const [newProdCategory, setNewProdCategory] = useState('Face Wash');
+  const [newProdIcon, setNewProdIcon] = useState('📦');
+  const [newProdStock, setNewProdStock] = useState('10');
+  const [newProdDescription, setNewProdDescription] = useState('');
+  const [newProdImageUrl, setNewProdImageUrl] = useState('');
+  const [newProdImageFile, setNewProdImageFile] = useState('');
+  const [newProdUploadedImages, setNewProdUploadedImages] = useState([]);
+  const [newProdPromoCode, setNewProdPromoCode] = useState('');
+  const [newProdPromoDiscount, setNewProdPromoDiscount] = useState('');
+  const [newProdImages, setNewProdImages] = useState('');
+  const [newProdBrand, setNewProdBrand] = useState('');
+  const [newProdWeight, setNewProdWeight] = useState('');
+  const [newProdWarranty, setNewProdWarranty] = useState('');
+  const [newProdVideoUrl, setNewProdVideoUrl] = useState('');
+  const [checkoutPromoCode, setCheckoutPromoCode] = useState('');
+  const [appliedPromo, setAppliedPromo] = useState(null);
+  const [newProdVideoType, setNewProdVideoType] = useState('youtube');
+  const [uploadingProductVideo, setUploadingProductVideo] = useState(false);
+  const [uploadingProductImages, setUploadingProductImages] = useState(false);
+  const [newProdAttributes, setNewProdAttributes] = useState({});
+  const [newAttrKey, setNewAttrKey] = useState('');
+  const [newAttrValues, setNewAttrValues] = useState('');
+
+  const [showAdminAuth, setShowAdminAuth] = useState(false);
+  const [adminAuthMode, setAdminAuthMode] = useState('login');
+  const [adminSetupStatus, setAdminSetupStatus] = useState(() =>
+    localStorage.getItem(ADMIN_SETUP_CACHE_KEY) === 'true' ? 'complete' : 'loading'
+  );
+  const [adminSetupRetryCount, setAdminSetupRetryCount] = useState(0);
+  const adminSetupRequestInProgress = useRef(false);
+  const [adminPasswordChangeRequired, setAdminPasswordChangeRequired] = useState(false);
+  const [newAdminPassword, setNewAdminPassword] = useState('');
+  const [confirmAdminPassword, setConfirmAdminPassword] = useState('');
+  const [adminSetupError, setAdminSetupError] = useState('');
+  const [adminPhone, setAdminPhone] = useState('');
+  const [adminPhoneLoading, setAdminPhoneLoading] = useState(false);
+  const [adminPhoneSaving, setAdminPhoneSaving] = useState(false);
+  const [adminPhoneError, setAdminPhoneError] = useState('');
+  const isAdminLoginPath = location.pathname === '/admin/login';
+
+  const loadAdminSetupStatus = async () => {
+    if (adminSetupRequestInProgress.current) return;
+    adminSetupRequestInProgress.current = true;
+    const setupWasCompleted = localStorage.getItem(ADMIN_SETUP_CACHE_KEY) === 'true';
+    try {
+      const { data } = await axios.get(`${API_URL}/admin/setup-status`);
+      if (!data.success || typeof data.ready !== 'boolean') {
+        throw new Error('Invalid admin setup status response');
+      }
+      setAdminSetupRetryCount(0);
+      setAdminSetupError('');
+      if (data.ready) {
+        localStorage.setItem(ADMIN_SETUP_CACHE_KEY, 'true');
+        setAdminSetupStatus('complete');
+      } else {
+        localStorage.removeItem(ADMIN_SETUP_CACHE_KEY);
+        setAdminSetupStatus('required');
+      }
+    } catch (error) {
+      setAdminSetupStatus(setupWasCompleted ? 'complete' : 'error');
+      if (!setupWasCompleted) {
+        setAdminSetupRetryCount(count => count + 1);
+        setAdminSetupError(error.response?.data?.message || error.message || 'The setup service is temporarily unavailable.');
+      }
+    } finally {
+      adminSetupRequestInProgress.current = false;
+    }
+  };
+
+  useEffect(() => {
+    loadAdminSetupStatus();
+  }, []);
+
+  useEffect(() => {
+    if (adminSetupStatus !== 'error') return undefined;
+    const delay = Math.min(1000 * (2 ** Math.min(adminSetupRetryCount, 4)), 15000);
+    const retryTimer = window.setTimeout(() => {
+      void loadAdminSetupStatus();
+    }, delay);
+    return () => window.clearTimeout(retryTimer);
+  }, [adminSetupStatus, adminSetupRetryCount]);
+
+  useEffect(() => {
+    if (!isAdminLoggedIn) {
+      setAdminPhone('');
+      setAdminPhoneError('');
+      return undefined;
+    }
+
+    let active = true;
+    const token = sessionStorage.getItem('velqra_token');
+    setAdminPhoneLoading(true);
+    setAdminPhoneError('');
+
+    axios.get(`${API_URL}/admin/phone`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }).then(({ data }) => {
+      if (!data.success || typeof data.phone !== 'string') {
+        throw new Error('Invalid admin phone response');
+      }
+      if (active) setAdminPhone(data.phone);
+    }).catch(error => {
+      if (active) {
+        setAdminPhoneError(error.response?.data?.message || 'Could not load the admin mobile number.');
+      }
+    }).finally(() => {
+      if (active) setAdminPhoneLoading(false);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [isAdminLoggedIn]);
+
+  useEffect(() => {
+    if (isAdminLoginPath && !isAdminLoggedIn) {
+      setAdminAuthMode('login');
+      setShowAdminAuth(true);
+    }
+  }, [isAdminLoginPath, isAdminLoggedIn]);
+  useEffect(() => {
+    const verifyAdminSession = async () => {
+      const token = sessionStorage.getItem('velqra_token');
+      if (!token) {
+        setIsAdminLoggedIn(false);
+        sessionStorage.removeItem('velqra_admin');
+        return;
+      }
+
+      try {
+        const res = await axios.get(`${AUTH_URL}/verify`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const isAdmin = res.data.success && res.data.user?.role === 'admin';
+        setIsAdminLoggedIn(isAdmin);
+        if (isAdmin) {
+          sessionStorage.setItem('velqra_admin', 'true');
+          sessionStorage.setItem('velqra_user', JSON.stringify(res.data.user));
+          setCurrentUser(res.data.user);
+        } else {
+          sessionStorage.removeItem('velqra_admin');
+        }
+      } catch {
+        setIsAdminLoggedIn(false);
+        sessionStorage.removeItem('velqra_admin');
+        sessionStorage.removeItem('velqra_token');
+      }
+    };
+
+    verifyAdminSession();
+  }, []);
+
+  useEffect(() => {
+    if (location.pathname !== '/') {
+      setIsMobileMenuOpen(false);
+      setIsMobilePoliciesOpen(false);
+      setIsMobileSocialOpen(false);
+    }
+  }, [location.pathname]);
+
+  const showToast = (message, type = 'success') => {
+    setToast({ show: true, message, type });
+    setTimeout(() => setToast({ show: false, message: '', type: 'success' }), 3000);
+  };
+
+  const resetCheckout = () => {
+    setCheckoutOpen(false);
+    savedAddressLookupRef.current = '';
+    setSavedAddressLookupStatus('');
+    pincodeLookupRef.current = '';
+    setPincodeLookupStatus('');
+    setPincodeLookupAttempt(0);
+    setPaymentMethod('cod');
+    setMarketingConsent(false);
+    setOrderSubmitError('');
+    setDeliveryForm({
+      fullName: currentUser?.name || '',
+      phone: getRegisteredPhone(currentUser),
+      alternatePhone: '',
+      email: currentUser?.email || '',
+      address: '',
+      landmark: '',
+      city: '',
+      district: '',
+      state: '',
+      pincode: '',
+      country: DEFAULT_COUNTRY.name,
+      countryCode: DEFAULT_COUNTRY.isoCode,
+      note: ''
+    });
+  };
+
+  // Registration OTP Timer
+  useEffect(() => {
+    let interval;
+    if (regTimer > 0) {
+      interval = setInterval(() => {
+        setRegTimer(prev => prev - 1);
+      }, 1000);
+    } else {
+      setRegResendDisabled(false);
+    }
+    return () => clearInterval(interval);
+  }, [regTimer]);
+
+  useEffect(() => {
+    const handleScroll = () => setIsHeaderScrolled(window.scrollY > 24);
+    handleScroll();
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  const startRegTimer = () => {
+    setRegTimer(60);
+    setRegResendDisabled(true);
+  };
+
+  const addAttribute = () => {
+    if (!newAttrKey.trim()) {
+      showToast('Please enter attribute name', 'error');
+      return;
+    }
+    if (!newAttrValues.trim()) {
+      showToast('Please enter attribute values (comma separated)', 'error');
+      return;
+    }
+
+    const values = newAttrValues.split(',').map(v => v.trim()).filter(Boolean);
+    if (values.length === 0) {
+      showToast('Please enter at least one value', 'error');
+      return;
+    }
+
+    setNewProdAttributes(prev => ({
+      ...prev,
+      [newAttrKey.trim()]: values
+    }));
+
+    setNewAttrKey('');
+    setNewAttrValues('');
+    showToast(`✅ Attribute "${newAttrKey.trim()}" added!`, 'success');
+  };
+
+  const removeAttribute = (key) => {
+    setNewProdAttributes(prev => {
+      const newAttrs = { ...prev };
+      delete newAttrs[key];
+      return newAttrs;
+    });
+  };
+
+  const calculateDeliveryCharge = () => 0;
+
+  const handlePlaceOrder = async (e) => {
+    e.preventDefault();
+    setOrderSubmitError('');
+
+    const token = sessionStorage.getItem('velqra_user_token');
+
+    if (cart.length === 0) {
+      showToast('Your cart is empty!', 'error');
+      return;
+    }
+
+    const requiredFields = ['fullName', 'phone', 'address', 'city', 'state', 'pincode', 'country'];
+    const missing = requiredFields.find(field => !String(deliveryForm[field]).trim());
+
+    if (missing) {
+      showToast(`Please fill ${missing.replace(/([A-Z])/g, ' $1').toLowerCase()}`, 'error');
+      return;
+    }
+
+    if (!deliveryPhone) {
+      showToast('Enter a valid phone number for the selected country.', 'error');
+      return;
+    }
+
+    if (paymentMethod === 'cod' && selectedCountry.isoCode !== 'IN') {
+      showToast('Cash on Delivery is available only for India.', 'error');
+      return;
+    }
+
+    if (paymentMethod === 'online' && !String(deliveryForm.email || currentUser?.email || '').trim()) {
+      showToast('Enter an email address for online payment.', 'error');
+      return;
+    }
+
+    if (paymentMethod === 'cod' && !deliveryForm.alternatePhone.trim()) {
+      showToast('Enter an alternate phone number.', 'error');
+      return;
+    }
+
+    const orderStatus = paymentMethod === 'online' ? 'Payment Verification Pending' : 'Pending';
+    const deliveryCharge = calculateDeliveryCharge();
+    const promoDiscountAmount = appliedPromo
+      ? Math.round(totalCartPrice * (appliedPromo.discount / 100))
+      : 0;
+    const finalTotal = Math.max(0, totalCartPrice - promoDiscountAmount) + deliveryCharge;
+
+    const orderData = {
+      idempotencyKey: window.crypto.randomUUID(),
+      items: cart.map(item => ({
+        _id: item._id,
+        name: item.name,
+        price: item.price,
+        qty: item.qty,
+        image: item.image || item.imageUrl || '',
+        originalPrice: item.originalPrice || 0,
+        discountPercent: item.discountPercent || 0,
+        category: item.category || '',
+        selectedAttributes: item.selectedAttributes || {},
+        promoApplied: item.promoApplied === true,
+        promoCode: item.promoApplied ? item.promoCode : ''
+      })),
+      total: finalTotal,
+      paymentMethod: paymentMethod,
+      attribution: getTrafficAttribution(marketingConsent),
+      marketingConsent,
+      status: orderStatus,
+      delivery: {
+        fullName: deliveryForm.fullName,
+        phone: deliveryPhone,
+        alternatePhone: paymentMethod === 'cod'
+          ? formatInternationalPhone(deliveryForm.alternatePhone, selectedCountry)
+          : '',
+        email: deliveryForm.email || currentUser?.email || '',
+        address: deliveryForm.address,
+        landmark: deliveryForm.landmark || '',
+        city: deliveryForm.city,
+        district: deliveryForm.district,
+        state: deliveryForm.state,
+        pincode: deliveryForm.pincode,
+        country: deliveryForm.country,
+        countryCode: selectedCountry.isoCode,
+        note: deliveryForm.note || ''
+      }
+    };
+
+        // ✅ Online payment — OTP skip, direct PayU redirect
+    if (paymentMethod === 'online') {
+      try {
+        setPlacingOrder(true);
+        const token = sessionStorage.getItem('velqra_user_token');
+
+        // 1. Order create karo (no OTP token needed)
+        const response = await axios.post(
+          `${API_URL}/orders`,
+          { ...orderData, skipOTP: true },   // 👈 skipOTP flag backend ke liye
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+              'Idempotency-Key': orderData.idempotencyKey
+            }
+          }
+        );
+
+        if (!response.data.success) {
+          showToast(response.data.message || 'Failed to place order', 'error');
+          setPlacingOrder(false);
+          return;
+        }
+
+        const orderId = response.data.order._id;
+        const guestOrderToken = response.data.guestOrderToken || '';
+        if (guestOrderToken) {
+          sessionStorage.setItem(`velqra_guest_order_token_${orderId}`, guestOrderToken);
+        }
+
+        // 2. Cart clear karo
+        setCart([]);
+        closeCart();
+        resetCheckout();
+        if (token) fetchOrders();
+
+        // 3. PayU redirect
+        showToast('🔒 Redirecting to PayU secure payment...', 'info');
+        const payuRes = await axios.post(
+          `${API_URL}/payment/payu/initiate`,
+          { orderId, guestOrderToken },
+          {
+            headers: {
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              ...(guestOrderToken ? { 'X-Guest-Order-Token': guestOrderToken } : {})
+            }
+          }
+        );
+
+        if (!payuRes.data.success) {
+          showToast('Payment initiation failed. Check My Orders.', 'error');
+          setTimeout(() => navigate(token ? '/orders' : `/orders?guestOrder=${encodeURIComponent(orderId)}`), 1500);
+          return;
+        }
+
+        const { paymentUrl, params } = payuRes.data;
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = getPayUPaymentUrl(paymentUrl);
+        Object.entries(params).forEach(([k, v]) => {
+          const inp = document.createElement('input');
+          inp.type = 'hidden';
+          inp.name = k;
+          inp.value = v;
+          form.appendChild(inp);
+        });
+        document.body.appendChild(form);
+        form.submit();
+        return;
+      } catch (err) {
+        const message = err.response?.data?.message || 'Failed to place order. Please try again.';
+        setOrderSubmitError(message);
+        showToast(message, 'error');
+        setPlacingOrder(false);
+        return;
+      }
+    }
+
+    // ✅ COD — OTP modal open karo (existing flow)
+    setPendingOrderData({
+      orderData,
+      finalTotal,
+      deliveryCharge,
+      isGuest: !token,
+      cartSnapshot: [...cart]
+    });
+    setIsOrderOTPModalOpen(true);
+  };
+
+    // 🆕 OTP verify hone ke baad actual order place + PayU redirect
+  const handleVerifyOrderOTP = async (orderConfirmToken) => {
+    if (!pendingOrderData) {
+      showToast('Missing order data', 'error');
+      setIsOrderOTPModalOpen(false);
+      return;
+    }
+    const { orderData, finalTotal, deliveryCharge, isGuest, cartSnapshot } = pendingOrderData;
+
+    try {
+      setPlacingOrder(true);
+      const token = sessionStorage.getItem('velqra_user_token');
+      const { idempotencyKey, ...orderPayload } = orderData;
+      const response = await axios.post(
+        `${API_URL}/orders`,
+        { ...orderPayload, orderConfirmToken },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            'Idempotency-Key': idempotencyKey
+          }
+        }
+      );
+
+      if (response.data.success) {
+        const orderId = response.data.order._id;
+        const guestOrderToken = response.data.guestOrderToken || '';
+        if (guestOrderToken) {
+          sessionStorage.setItem(`velqra_guest_order_token_${orderId}`, guestOrderToken);
+        }
+
+        setCart([]);
+        closeCart();
+        setIsOrderOTPModalOpen(false);
+        setPendingOrderData(null);
+        resetCheckout();
+        if (token) fetchOrders();
+
+        if (paymentMethod === 'online') {
+          showToast('🔒 Redirecting to PayU secure payment...', 'info');
+          try {
+            const payuRes = await axios.post(
+              `${API_URL}/payment/payu/initiate`,
+              { orderId, guestOrderToken },
+              {
+                headers: {
+                  ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                  ...(guestOrderToken ? { 'X-Guest-Order-Token': guestOrderToken } : {})
+                }
+              }
+            );
+
+            if (!payuRes.data.success) {
+              showToast('Payment initiation failed. Order placed — check My Orders.', 'error');
+              setTimeout(() => navigate(isGuest
+                ? `/orders?guestOrder=${encodeURIComponent(orderId)}`
+                : '/orders'), 1500);
+              return;
+            }
+
+            const { paymentUrl, params } = payuRes.data;
+
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = getPayUPaymentUrl(paymentUrl);
+            Object.entries(params).forEach(([k, v]) => {
+              const inp = document.createElement('input');
+              inp.type = 'hidden';
+              inp.name = k;
+              inp.value = v;
+              form.appendChild(inp);
+            });
+            document.body.appendChild(form);
+            form.submit();
+            return;
+          } catch (payuErr) {
+            showToast('Payment could not be initiated. Check My Orders.', 'error');
+            setTimeout(() => navigate(isGuest
+              ? `/orders?guestOrder=${encodeURIComponent(orderId)}`
+              : '/orders'), 2000);
+            return;
+          }
+        } else {
+          showToast('✅ Order placed successfully! Cash on delivery selected.', 'success');
+        }
+
+        setTimeout(() => {
+          navigate(isGuest
+            ? `/orders?guestOrder=${encodeURIComponent(orderId)}`
+            : '/orders');
+        }, 2000);
+      } else {
+        showToast(response.data.message || 'Failed to place order', 'error');
+      }
+    } catch (err) {
+      showToast(err.response?.data?.message || 'Failed to place order. Please try again.', 'error');
+    } finally {
+      setPlacingOrder(false);
+    }
+  };
+
+
+  const fetchProducts = async () => {
+    if (productFetchInProgress.current) return;
+    productFetchInProgress.current = true;
+    setCatalogLoading(getCachedProducts().length === 0);
+    setCatalogError('');
+    try {
+      if (!isSupabaseConfigured) {
+        throw new Error('Add Supabase URL and anon key to load products.');
+      }
+      let productsData = null;
+      let lastError = null;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const { data, error } = await supabase.from('products').select('*');
+        if (!error) {
+          productsData = (data || []).map(normalizeProduct);
+          break;
+        }
+        lastError = error;
+        if (attempt < 3) {
+          await new Promise(resolve => window.setTimeout(resolve, 500 * (2 ** attempt)));
+        }
+      }
+      if (!productsData) throw lastError || new Error('Could not load products.');
+      setProducts(productsData);
+      localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(productsData));
+    } catch (error) {
+      const message = error.message || 'Failed to load products from Supabase.';
+      setCatalogError(message);
+      showToast(message, 'error');
+    } finally {
+      productFetchInProgress.current = false;
+      setCatalogLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if ((location.pathname === '/' || location.pathname === '/admin') &&
+        adminSetupStatus === 'complete') {
+      void fetchProducts();
+    }
+  }, [location.pathname, adminSetupStatus]);
+
+  const syncGuestCart = async (token, user) => {
+    if (!token || !user || user.role === 'admin' || cart.length === 0) return;
+
+    try {
+      const { data: currentCart } = await axios.get(`${API_URL}/cart`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const existingItems = normalizeCart(currentCart.cart?.items || []);
+      const mergedItems = [...existingItems];
+
+      cart.forEach(item => {
+        const key = getCartItemKey(item);
+        const existing = mergedItems.find(candidate => getCartItemKey(candidate) === key);
+        if (existing) {
+          existing.qty = Math.min(existing.stock || item.stock, existing.qty + item.qty);
+        } else {
+          mergedItems.push(item);
+        }
+      });
+
+      const { data } = await axios.post(`${API_URL}/cart/sync`, {
+        items: mergedItems.map(item => ({
+          _id: item._id,
+          qty: item.qty,
+          selectedAttributes: item.selectedAttributes || {},
+          promoCode: item.promoApplied ? item.promoCode : ''
+        }))
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!data.success) throw new Error(data.message || 'Unable to save cart');
+      setCart(normalizeCart(data.cart?.items || []));
+    } catch (cartError) {
+      showToast('Your account was signed in, but the cart could not be synced.', 'error');
+    }
+  };
+
+  const queueCartMutation = (operation) => {
+    cartMutationQueue.current = cartMutationQueue.current.then(operation, operation);
+    return cartMutationQueue.current;
+  };
+
+  useEffect(() => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (currentUser?.role === 'admin') {
+      setCart([]);
+      setCartLoading(false);
+      return;
+    }
+    if (!isUserLoggedIn || !token) {
+      setCart([]);
+      setCartLoading(false);
+      return;
+    }
+
+    let active = true;
+    setCartLoading(true);
+    axios.get(`${API_URL}/cart`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }).then(({ data }) => {
+      if (active && data.success) setCart(normalizeCart(data.cart?.items || []));
+    }).catch(cartError => {
+      if (!active) return;
+      showToast('Unable to load your saved cart.', 'error');
+    }).finally(() => {
+      if (active) setCartLoading(false);
+    });
+
+    return () => { active = false; };
+  }, [isUserLoggedIn, currentUser?.role]);
+
+  const fetchOrders = async () => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (!token) return;
+
+    setOrdersLoading(true);
+    try {
+      const res = await axios.get(`${API_URL}/orders`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.data.success) {
+        setOrders(res.data.orders || []);
+      }
+    } catch (err) {
+    } finally {
+      setOrdersLoading(false);
+    }
+  };
+
+  const fetchAdminReturns = async () => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (!token) return;
+
+    setReturnsLoading(true);
+    try {
+      const { data } = await axios.get(`${API_URL}/admin/returns`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (data.success) setReturnRequests(data.returns || []);
+    } catch (error) {
+      showToast(error.response?.data?.message || 'Unable to load return requests', 'error');
+    } finally {
+      setReturnsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isUserLoggedIn && !isAdminLoggedIn) return undefined;
+    fetchOrders();
+    if (!isAdminLoggedIn) return undefined;
+    fetchAdminReturns();
+
+    const refreshTimer = window.setInterval(() => {
+      fetchOrders();
+      fetchAdminReturns();
+    }, 30000);
+    return () => window.clearInterval(refreshTimer);
+  }, [isUserLoggedIn, isAdminLoggedIn]);
+
+  useEffect(() => {
+    setDeliveryForm(prev => ({
+      ...prev,
+      fullName: currentUser?.name || prev.fullName || '',
+      email: currentUser?.email || prev.email || ''
+    }));
+  }, [currentUser?.name, currentUser?.email]);
+
+  useEffect(() => {
+    if (location.pathname === '/login' || location.pathname === '/register') {
+      setUserAuthMode(location.pathname === '/register' ? 'register' : 'login');
+      setIsAuthModalOpen(true);
+    } else {
+      setIsAuthModalOpen(false);
+    }
+  }, [location.pathname]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode');
+    if (mode === 'login' || mode === 'register') {
+      openUserAuth(mode);
+    }
+  }, [location.search]);
+
+  useEffect(() => {
+    const handler = (event) => {
+      addToCart(event.detail);
+    };
+    window.addEventListener('addToCart', handler);
+    return () => window.removeEventListener('addToCart', handler);
+  }, []);
+
+  // Register - Step 1: Send OTP
+    const handleSendRegistrationOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    if (regPassword !== regConfirmPassword) {
+      setError('Passwords do not match');
+      setLoading(false);
+      return;
+    }
+
+    if (regPassword.length < 8 || regPassword.length > 72) {
+      setError('Password must be at least 8 characters long');
+      setLoading(false);
+      return;
+    }
+
+    const normalizedEmail = regEmail.trim().toLowerCase();
+    if (!isValidGmailAddress(normalizedEmail)) {
+      setError('Enter a valid Gmail address ending in @gmail.com');
+      setLoading(false);
+      return;
+    }
+
+    const normalizedPhone = String(regPhone).replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+    if (!/^[6-9]\d{9}$/.test(normalizedPhone)) {
+      setError('Please enter a valid 10-digit mobile number');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const res = await axios.post(`${AUTH_URL}/register`, {
+        name: regName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        password: regPassword,
+        confirmPassword: regConfirmPassword
+      });
+
+      if (res.data.success) {
+        setRegStep('otp');
+        startRegTimer();
+        if (res.data.smsOtp) {
+          setRegSmsOtp(res.data.smsOtp || '');
+          showToast('🧪 Local test mode: SMS code auto-filled.', 'info');
+        } else {
+          showToast('✅ SMS verification code sent to your mobile.', 'success');
+        }
+      } else {
+        setError(res.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Registration failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+    // Register - Step 2: Verify OTP (SMS only)
+  const handleVerifyRegistrationOTP = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    if (regSmsOtp.length !== 6) {
+      setError('Enter the 6-digit SMS verification code');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const normalizedPhone = String(regPhone).replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+      const res = await axios.post(`${AUTH_URL}/verify-registration`, {
+        phone: normalizedPhone,
+        smsOtp: regSmsOtp.trim()
+      });
+
+      if (res.data.success) {
+        const userData = res.data.user;
+        const token = res.data.token;
+        await syncGuestCart(token, userData);
+        setCurrentUser(userData);
+        setIsUserLoggedIn(true);
+        sessionStorage.setItem('velqra_user', JSON.stringify(userData));
+        sessionStorage.setItem('velqra_user_token', token);
+        window.dispatchEvent(new Event('velqra-auth-change'));
+        setRegStep('success');
+        setIsAuthModalOpen(false);
+        navigate('/');
+        showToast('✅ Registration completed successfully!', 'success');
+
+        setRegName('');
+        setRegEmail('');
+        setRegPhone('');
+        setRegPassword('');
+        setRegConfirmPassword('');
+        setRegSmsOtp('');
+        setRegStep('form');
+        setUserAuthMode('login');
+      } else {
+        setError(res.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to verify OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  // Resend Registration OTP
+    // Resend Registration OTP (SMS only)
+  const handleResendRegistrationOTP = async () => {
+    setLoading(true);
+    setError('');
+
+    try {
+      const normalizedPhone = String(regPhone).replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+      const res = await axios.post(`${AUTH_URL}/resend-registration-otp`, {
+        phone: normalizedPhone
+      });
+
+      if (res.data.success) {
+        startRegTimer();
+        if (res.data.smsOtp) {
+          setRegSmsOtp(res.data.smsOtp || '');
+          showToast('🧪 Local test mode: SMS code auto-filled.', 'info');
+        } else {
+          showToast('✅ SMS verification code resent!', 'success');
+        }
+      } else {
+        setError(res.data.message);
+      }
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to resend OTP. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // User Login
+  const handleUserLogin = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const res = await axios.post(`${AUTH_URL}/login`, {
+        email: userEmail.trim(),
+        password: userPassword
+      });
+
+      const loginData = requireLoginResponse(res.data);
+      const userData = loginData.user;
+      await syncGuestCart(loginData.token, userData);
+      setCurrentUser(userData);
+      setIsUserLoggedIn(true);
+      sessionStorage.setItem('velqra_user', JSON.stringify(userData));
+      sessionStorage.setItem('velqra_user_token', loginData.token);
+      window.dispatchEvent(new Event('velqra-auth-change'));
+      if (userData.role === 'admin') {
+        setIsAdminLoggedIn(true);
+        sessionStorage.setItem('velqra_admin', 'true');
+        sessionStorage.setItem('velqra_token', loginData.token);
+        navigate('/admin');
+      } else {
+        navigate('/');
+      }
+      setUserEmail('');
+      setUserPassword('');
+      setIsAuthModalOpen(false);
+      if (userData.role !== 'admin' && pendingReviewProduct) {
+        setActiveReviewsProduct(pendingReviewProduct);
+        setPendingReviewProduct(null);
+      }
+      showToast('✅ Login successful!', 'success');
+    } catch (err) {
+      const errorMsg = err.response?.data?.message || err.message || 'Login failed. Please try again.';
+      setError(errorMsg);
+      showToast(errorMsg, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUserLogout = () => {
+    setIsUserLoggedIn(false);
+    setCurrentUser(null);
+    setIsAdminLoggedIn(false);
+    sessionStorage.removeItem('velqra_user');
+    sessionStorage.removeItem('velqra_user_token');
+    sessionStorage.removeItem('velqra_token');
+    sessionStorage.removeItem('velqra_admin');
+    window.dispatchEvent(new Event('velqra-auth-change'));
+    showToast('👋 Logged out', 'info');
+  };
+
+  const handleAdminLogin = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setAdminSetupError('');
+    try {
+      const res = await axios.post(`${AUTH_URL}/login`, { username: 'admin', password: loginPassword });
+      const loginData = requireLoginResponse(res.data);
+      const userRole = loginData.user?.role;
+      if (userRole !== 'admin') {
+        setAdminSetupError('This account is not an admin account.');
+        return;
+      }
+
+      setIsAdminLoggedIn(true);
+      await syncGuestCart(loginData.token, loginData.user);
+      sessionStorage.setItem('velqra_admin', 'true');
+      sessionStorage.setItem('velqra_token', loginData.token);
+      sessionStorage.setItem('velqra_user', JSON.stringify(loginData.user));
+      sessionStorage.setItem('velqra_user_token', loginData.token);
+      window.dispatchEvent(new Event('velqra-auth-change'));
+      setCurrentUser(loginData.user);
+      setIsUserLoggedIn(true);
+      setShowAdminAuth(false);
+      setLoginPassword('');
+      setAdminPasswordChangeRequired(Boolean(loginData.mustChangePassword));
+      setAdminSetupStatus(loginData.mustChangePassword ? 'required' : 'complete');
+      if (!loginData.mustChangePassword) {
+        localStorage.setItem(ADMIN_SETUP_CACHE_KEY, 'true');
+        navigate('/admin');
+        showToast('🚀 Welcome Admin!', 'success');
+      } else {
+        localStorage.removeItem(ADMIN_SETUP_CACHE_KEY);
+      }
+    } catch (err) {
+      const message = err.response?.data?.message || err.message || 'Login failed';
+      setAdminSetupError(message);
+      if (adminSetupStatus === 'complete') showToast(message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminPasswordChange = async (e) => {
+    e.preventDefault();
+    setAdminSetupError('');
+    if (newAdminPassword !== confirmAdminPassword) {
+      setAdminSetupError('Passwords do not match.');
+      return;
+    }
+    if (newAdminPassword.length < 12) {
+      setAdminSetupError('Use a password with at least 12 characters.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      await axios.put(`${API_URL}/admin/password`, { newPassword: newAdminPassword }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setNewAdminPassword('');
+      setConfirmAdminPassword('');
+      setAdminPasswordChangeRequired(false);
+      setAdminSetupStatus('complete');
+      localStorage.setItem(ADMIN_SETUP_CACHE_KEY, 'true');
+      navigate('/admin');
+      showToast('Admin password updated. The storefront is now available.', 'success');
+    } catch (err) {
+      setAdminSetupError(err.response?.data?.message || 'Could not update the admin password.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminPhoneSave = async (e) => {
+    e.preventDefault();
+    setAdminPhoneError('');
+    const normalizedPhone = adminPhone.replace(/\D/g, '');
+    if (!/^[6-9]\d{9}$/.test(normalizedPhone)) {
+      setAdminPhoneError('Enter a valid 10-digit mobile number.');
+      return;
+    }
+
+    setAdminPhoneSaving(true);
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      const { data } = await axios.put(`${API_URL}/admin/phone`, { phone: normalizedPhone }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setAdminPhone(data.phone);
+      setCurrentUser(prev => {
+        if (!prev || prev.role !== 'admin') return prev;
+        const updatedUser = { ...prev, phone: data.phone };
+        sessionStorage.setItem('velqra_user', JSON.stringify(updatedUser));
+        return updatedUser;
+      });
+      showToast('Admin mobile number updated.', 'success');
+    } catch (error) {
+      setAdminPhoneError(error.response?.data?.message || 'Could not update the admin mobile number.');
+    } finally {
+      setAdminPhoneSaving(false);
+    }
+  };
+
+  const handleAdminRegister = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const res = await axios.post(`${AUTH_URL}/register`, {
+        name: registerName,
+        email: registerEmail,
+        password: registerPassword
+      });
+      if (res.data.success) {
+        showToast('✅ Admin registration successful! Please login.', 'success');
+        setAdminAuthMode('login');
+        setRegisterName('');
+        setRegisterEmail('');
+        setRegisterPassword('');
+      }
+    } catch (err) {
+      showToast(err.response?.data?.message || 'Registration failed', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminLogout = () => {
+    setIsAdminLoggedIn(false);
+    sessionStorage.removeItem('velqra_admin');
+    sessionStorage.removeItem('velqra_token');
+    sessionStorage.removeItem('velqra_user');
+    sessionStorage.removeItem('velqra_user_token');
+    setCurrentUser(null);
+    setIsUserLoggedIn(false);
+    setCart([]);
+    window.dispatchEvent(new Event('velqra-auth-change'));
+    showToast('👋 Admin Logged out', 'info');
+    navigate('/', { replace: true });
+  };
+
+  const handleOrderStatusChange = async (orderId, status) => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    try {
+      const res = await axios.patch(`${API_URL}/orders/${orderId}/status`, { status }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.data.success) {
+        setOrders(prev => prev.map(order => order._id === orderId ? res.data.order : order));
+        showToast('✅ Order status updated', 'success');
+      }
+    } catch (err) {
+      showToast(err.response?.data?.message || 'Failed to update status', 'error');
+    }
+  };
+
+  const handleVerifyPayment = async (orderId) => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (!token) return showToast('Admin login required', 'error');
+
+    setVerifyingPaymentId(orderId);
+    try {
+      const { data } = await axios.patch(
+        `${API_URL}/orders/${orderId}/verify-payment`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!data.success) throw new Error(data.message || 'Payment verification failed');
+      setOrders(prev => prev.map(order => order._id === orderId ? data.order : order));
+      showToast('PayU payment verified successfully', 'success');
+    } catch (error) {
+      showToast(error.response?.data?.message || error.message || 'Unable to verify payment', 'error');
+    } finally {
+      setVerifyingPaymentId(null);
+    }
+  };
+
+  const handlePrintShippingLabel = async (order) => {
+    const printWindow = window.open('', '_blank', 'width=640,height=900');
+    if (!printWindow) {
+      showToast('Allow pop-ups to print the shipping label.', 'error');
+      return;
+    }
+
+    try {
+      printWindow.opener = null;
+      printWindow.document.open();
+      printWindow.document.write(getShippingLabelHtml(order));
+      printWindow.document.close();
+
+      const logo = printWindow.document.querySelector('.logo');
+      if (!logo.complete) {
+        await new Promise((resolve, reject) => {
+          logo.addEventListener('load', resolve, { once: true });
+          logo.addEventListener('error', reject, { once: true });
+        });
+      }
+      if (!logo.naturalWidth) throw new Error('VELQRA logo could not be loaded');
+
+      printWindow.onafterprint = () => printWindow.close();
+      printWindow.focus();
+      printWindow.print();
+    } catch (error) {
+      printWindow.close();
+      showToast(error.message || 'Could not prepare the shipping label.', 'error');
+    }
+  };
+
+  const handleReturnStatusChange = async (returnId, status) => {
+    if (status === 'Refunded' && !window.confirm(
+      'Mark refunded only after the actual refund is confirmed by the payment provider/bank. Continue?'
+    )) return;
+
+    const token = sessionStorage.getItem('velqra_user_token');
+    setUpdatingReturnId(returnId);
+    try {
+      const { data } = await axios.patch(
+        `${API_URL}/admin/returns/${returnId}/status`,
+        { status },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!data.success) throw new Error(data.message || 'Could not update return status');
+      setReturnRequests(prev => prev.map(returnRequest =>
+        returnRequest.id === returnId ? data.returnRequest : returnRequest
+      ));
+      fetchOrders();
+      showToast(`Return status updated: ${status}`, 'success');
+    } catch (error) {
+      showToast(error.response?.data?.message || error.message || 'Could not update return status', 'error');
+    } finally {
+      setUpdatingReturnId(null);
+    }
+  };
+
+  // Add Product
+  const handleProductImageUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Please select a valid image file', 'error');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      showToast('Image size must be 5 MB or less', 'error');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      setNewProdImageFile(reader.result);
+      setNewProdImageUrl(String(reader.result));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleProductImagesUpload = async (event) => {
+    const input = event.currentTarget;
+    const files = Array.from(input.files || []);
+    input.value = '';
+    if (files.length === 0) return;
+
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    const invalidType = files.find(file => !allowedTypes.includes(file.type));
+    if (invalidType) {
+      showToast('Choose JPG, PNG, or WebP product images.', 'error');
+      return;
+    }
+    const oversizedFile = files.find(file => file.size > 5 * 1024 * 1024);
+    if (oversizedFile) {
+      showToast('Each product image must be 5 MB or less.', 'error');
+      return;
+    }
+
+    setUploadingProductImages(true);
+    let uploadedCount = 0;
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append('image', file);
+        const { data } = await axios.post(`${API_URL}/admin/products/upload-image`, formData, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!data.success || !data.imageUrl) {
+          throw new Error('Image upload did not return an image URL.');
+        }
+        setNewProdUploadedImages(currentImages => [...currentImages, data.imageUrl]);
+        uploadedCount += 1;
+      }
+      showToast(`✅ ${uploadedCount} product image${uploadedCount === 1 ? '' : 's'} uploaded.`, 'success');
+    } catch (err) {
+      const partialUploadMessage = uploadedCount > 0
+        ? ` ${uploadedCount} image${uploadedCount === 1 ? '' : 's'} uploaded before the failure.`
+        : '';
+      showToast(`${err.response?.data?.message || err.message || 'Product image upload failed.'}${partialUploadMessage}`, 'error');
+    } finally {
+      setUploadingProductImages(false);
+    }
+  };
+
+  const handleProductVideoUpload = async (event) => {
+    const file = event.target.files?.[0];
+    const input = event.currentTarget;
+    if (!file) return;
+    const supportedVideoTypes = ['video/mp4', 'video/webm', 'video/quicktime', 'video/ogg'];
+    if (!supportedVideoTypes.includes(file.type)) {
+      showToast('Choose an MP4, WebM, MOV, or OGG video.', 'error');
+      input.value = '';
+      return;
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      showToast('Video size must be 50 MB or less.', 'error');
+      input.value = '';
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('video', file);
+    setUploadingProductVideo(true);
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      const { data } = await axios.post(`${API_URL}/admin/products/upload-video`, formData, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!data.success || !data.videoUrl) throw new Error('Video upload did not return a video URL.');
+      setNewProdVideoUrl(data.videoUrl);
+      setNewProdVideoType('uploaded');
+      showToast('✅ Product demo video uploaded.', 'success');
+    } catch (err) {
+      showToast(err.response?.data?.message || err.message || 'Video upload failed.', 'error');
+    } finally {
+      setUploadingProductVideo(false);
+      input.value = '';
+    }
+  };
+
+  const handleAddProduct = async (e) => {
+    e.preventDefault();
+    if (uploadingProductImages || uploadingProductVideo) {
+      showToast('Wait for product media uploads to finish.', 'error');
+      return;
+    }
+    const manuallyAddedImageUrls = newProdImages.split(',').map(image => image.trim()).filter(Boolean);
+    const productImageUrls = [
+      newProdImageUrl.trim(),
+      ...newProdUploadedImages,
+      ...manuallyAddedImageUrls
+    ].filter(Boolean);
+    if (!newProdName || !newProdOriginalPrice || (productImageUrls.length === 0 && !newProdVideoUrl)) {
+      showToast('Name, price, and an image or video are required.', 'error');
+      return;
+    }
+    const promoCode = newProdPromoCode.trim().toUpperCase();
+    const promoDiscount = Number(newProdPromoDiscount) || 0;
+    if ((promoCode && (promoDiscount <= 0 || promoDiscount > 100)) ||
+      (!promoCode && promoDiscount > 0)) {
+      showToast('Enter both a promo code and a discount between 1% and 100%.', 'error');
+      return;
+    }
+    const stock = newProdStock.trim() === '' ? 10 : Number(newProdStock);
+    if (!Number.isSafeInteger(stock) || stock < 0) {
+      showToast('Stock must be a non-negative whole number.', 'error');
+      return;
+    }
+
+    const productData = {
+      name: newProdName,
+      originalPrice: parseFloat(newProdOriginalPrice),
+      discountPercent: parseFloat(newProdDiscount) || 0,
+      category: newProdCategory,
+      icon: newProdIcon,
+      stock,
+      description: newProdDescription,
+      brand: newProdBrand,
+      weight: newProdWeight || null,
+      warranty: newProdWarranty || '',
+      imageUrl: productImageUrls[0] || '',
+      images: productImageUrls,
+      videoUrl: newProdVideoUrl.trim() || '',
+      videoType: newProdVideoType || 'youtube',
+      attributes: newProdAttributes,
+      promoCode,
+      promoDiscount
+    };
+
+    setLoading(true);
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      const res = await axios.post(`${API_URL}/products/add`, productData, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (res.data.success) {
+        const savedProduct = { ...res.data.product, _id: res.data.product._id || res.data.product.id };
+        setProducts(currentProducts => {
+          const updatedProducts = [savedProduct, ...currentProducts];
+          localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(updatedProducts));
+          return updatedProducts;
+        });
+        setNewProdName('');
+        setNewProdOriginalPrice('');
+        setNewProdDiscount('0');
+        setNewProdStock('10');
+        setNewProdDescription('');
+        setNewProdImageUrl('');
+        setNewProdImageFile('');
+        setNewProdUploadedImages([]);
+        setNewProdImages('');
+        setNewProdBrand('');
+        setNewProdWeight('');
+        setNewProdWarranty('');
+        setNewProdVideoUrl('');
+        setNewProdVideoType('youtube');
+        setNewProdAttributes({});
+        setNewProdPromoCode('');
+        setNewProdPromoDiscount('');
+        setNewAttrKey('');
+        setNewAttrValues('');
+        showToast('✅ Product added successfully!', 'success');
+      }
+    } catch (err) {
+      showToast(err.response?.data?.message || 'Failed to add product', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteProduct = async (id) => {
+    if (window.confirm('Delete this product?')) {
+      setLoading(true);
+      try {
+        const token = sessionStorage.getItem('velqra_token');
+        await axios.delete(`${API_URL}/products/delete/${id}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        setProducts(currentProducts => {
+          const updatedProducts = currentProducts.filter(p => p._id !== id);
+          localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(updatedProducts));
+          return updatedProducts;
+        });
+        setCart(cart.filter(item => item._id !== id));
+        showToast('🗑️ Product deleted', 'success');
+      } catch (err) {
+        showToast('Failed to delete', 'error');
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+
+  const handleUpdateProductStock = async (product) => {
+    const rawStock = productStockDrafts[product._id] ?? product.stock;
+    const stock = rawStock === '' ? NaN : Number(rawStock);
+    if (!Number.isSafeInteger(stock) || stock < 0) {
+      showToast('Stock must be a non-negative whole number.', 'error');
+      return;
+    }
+
+    setStockUpdatingId(product._id);
+    try {
+      const token = sessionStorage.getItem('velqra_token');
+      const { data } = await axios.put(
+        `${API_URL}/products/update/${product._id}`,
+        { stock },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!data.success || !data.product) {
+        throw new Error(data.message || 'Failed to update product stock.');
+      }
+
+      const updatedProduct = normalizeProduct(data.product);
+      setProducts(currentProducts => {
+        const updatedProducts = currentProducts.map(currentProduct =>
+          currentProduct._id === product._id
+            ? { ...currentProduct, ...updatedProduct }
+            : currentProduct
+        );
+        localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(updatedProducts));
+        return updatedProducts;
+      });
+      setProductStockDrafts(currentDrafts => {
+        const nextDrafts = { ...currentDrafts };
+        delete nextDrafts[product._id];
+        return nextDrafts;
+      });
+      showToast(stock === 0 ? 'Product is now out of stock.' : 'Product stock updated.', 'success');
+    } catch (stockError) {
+      showToast(
+        stockError.response?.data?.message || stockError.message || 'Failed to update product stock.',
+        'error'
+      );
+    } finally {
+      setStockUpdatingId(null);
+    }
+  };
+
+  const addToCart = async (product, { openCartPage = true } = {}) => {
+    const stock = Number(product.stock);
+    if (!Number.isFinite(stock) || stock <= 0) {
+      showToast('Out of stock!', 'error');
+      return false;
+    }
+
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (token && currentUser?.role !== 'admin') {
+      setCartLoading(true);
+      try {
+        await queueCartMutation(async () => {
+          const { data } = await axios.post(`${API_URL}/cart/add`, {
+            productId: product._id,
+            qty: 1,
+            selectedAttributes: product.selectedAttributes || {},
+            promoCode: product.promoApplied ? product.promoCode : ''
+          }, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (!data.success) throw new Error(data.message || 'Unable to add product to cart');
+          setCart(normalizeCart(data.cart?.items || []));
+        });
+        if (openCartPage) openCart();
+        return true;
+      } catch (cartError) {
+        showToast(cartError.response?.data?.message || 'Could not add product to cart', 'error');
+        return false;
+      } finally {
+        setCartLoading(false);
+      }
+    }
+
+    const productKey = getCartItemKey(product);
+    const productQuantity = cart
+      .filter(item => String(item._id) === String(product._id))
+      .reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
+    if (productQuantity >= stock) {
+      showToast('Not enough stock', 'error');
+      return false;
+    }
+
+    setCart(prev => {
+      const current = prev.find(item => getCartItemKey(item) === productKey);
+      if (current) {
+        return prev.map(item => getCartItemKey(item) === productKey
+          ? { ...item, qty: item.qty + 1 }
+          : item);
+      }
+      return [...prev, { ...product, qty: 1 }];
+    });
+    if (openCartPage) openCart();
+    return true;
+  };
+
+  const updateQty = (cartItem, change) => {
+    const token = sessionStorage.getItem('velqra_user_token');
+    if (token && currentUser?.role !== 'admin') {
+      queueCartMutation(async () => {
+        const { data: current } = await axios.get(`${API_URL}/cart`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const currentItem = normalizeCart(current.cart?.items || []).find(item =>
+          getCartItemKey(item) === getCartItemKey(cartItem)
+        );
+        if (!currentItem) return;
+        const qty = Math.max(0, currentItem.qty + change);
+        if (qty > currentItem.stock) {
+          showToast('Not enough stock', 'error');
+          return;
+        }
+        const { data } = await axios.put(`${API_URL}/cart/update/${cartItem._id}`, {
+          qty,
+          selectedAttributes: currentItem.selectedAttributes || {},
+          promoCode: currentItem.promoCode || ''
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!data.success) throw new Error(data.message || 'Unable to update cart');
+        setCart(normalizeCart(data.cart?.items || []));
+      }).catch(cartError => {
+        showToast(cartError.response?.data?.message || 'Could not update cart', 'error');
+      });
+      return;
+    }
+
+    setCart(prev =>
+      prev.map(item => {
+        if (getCartItemKey(item) === getCartItemKey(cartItem)) {
+          const newQty = item.qty + change;
+          const otherProductQty = prev
+            .filter(candidate => String(candidate._id) === String(cartItem._id) &&
+              getCartItemKey(candidate) !== getCartItemKey(cartItem))
+            .reduce((sum, candidate) => sum + (Number(candidate.qty) || 0), 0);
+          if (change > 0 && newQty + otherProductQty > item.stock) {
+            showToast('Not enough stock', 'error');
+            return item;
+          }
+          return newQty > 0 ? { ...item, qty: newQty } : null;
+        }
+        return item;
+      }).filter(Boolean)
+    );
+  };
+
+  const categories = [...new Set(
+    (Array.isArray(products) ? products : [])
+      .map(product => String(product?.category || '').trim())
+      .filter(Boolean)
+  )].sort((a, b) => a.localeCompare(b));
+  const normalizedSearch = searchQuery.trim().toLowerCase();
+  const selectedCurrencyRate = currency === 'INR' ? 1 : Number(exchangeRates[currency]);
+  const selectedCurrencyAvailable = Number.isFinite(selectedCurrencyRate) && selectedCurrencyRate > 0;
+  const filteredProducts = (Array.isArray(products) ? products : [])
+    .filter(product => {
+      const matchSearch = matchesProductSearch(product, normalizedSearch);
+      const categoryKey = String(product?.category || '').toLowerCase().replace(/[\s_-]+/g, '');
+      const matchCategory = activeCategory === 'All' || categoryKey === 'facewash';
+      return matchSearch && matchCategory;
+    })
+    .sort((left, right) =>
+      getProductSearchScore(left, normalizedSearch) - getProductSearchScore(right, normalizedSearch)
+    );
+  const searchSuggestions = filteredProducts.slice(0, 5);
+  const submitHeaderSearch = () => {
+    setIsHeaderSearchOpen(false);
+    setIsMobileMenuOpen(false);
+    if (location.pathname !== '/') {
+      navigate('/#products');
+      return;
+    }
+    document.getElementById('products')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  const totalCartItems = cart.reduce((sum, item) => sum + item.qty, 0);
+  const totalCartPrice = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+  const totalSavings = cart.reduce((sum, item) => {
+    return sum + ((item.originalPrice - item.price) * item.qty);
+  }, 0);
+
+  const deliveryCharge = calculateDeliveryCharge();
+  const promoDiscountAmount = appliedPromo
+    ? Math.round(totalCartPrice * (appliedPromo.discount / 100))
+    : 0;
+  const grandTotal = Math.max(0, totalCartPrice - promoDiscountAmount) + deliveryCharge;
+
+  if (adminSetupStatus === 'required' || adminSetupStatus === 'error') {
+    const changingPassword = adminPasswordChangeRequired;
+
+    return (
+      <>
+      <main className="min-h-screen bg-[#f1f1ef] px-4 py-10 text-slate-900 flex items-center justify-center">
+        <section className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-7 shadow-xl">
+          <div className="mb-6 text-center">
+            <img src={velqraLogo} alt="VELQRA" className="mx-auto mb-5 h-12 w-auto object-contain" />
+            <h1 className="text-xl font-black text-[#173b32]">
+              {adminSetupStatus === 'error'
+                ? 'Store setup unavailable'
+                : changingPassword
+                  ? 'Set a new admin password'
+                  : 'Admin setup required'}
+            </h1>
+            <p className="mt-2 text-sm text-slate-500">
+              {adminSetupStatus === 'error'
+                ? 'The setup service is temporarily unavailable. This page will retry automatically.'
+                : changingPassword
+                  ? 'Choose a new password to unlock the storefront.'
+                  : 'Sign in as the admin and change the initial password before the storefront opens.'}
+            </p>
+          </div>
+
+          {adminSetupStatus === 'error' ? (
+            <>
+              <p role="status" className="mb-3 text-xs text-slate-400">{adminSetupError}</p>
+              <button
+                type="button"
+                onClick={() => void loadAdminSetupStatus()}
+                className="w-full rounded-xl bg-[#173b32] py-3 text-sm font-bold text-white"
+              >
+                Retry now
+              </button>
+            </>
+          ) : changingPassword ? (
+            <form onSubmit={handleAdminPasswordChange} className="space-y-4">
+              <label className="block text-xs font-bold uppercase tracking-wide text-slate-500">
+                New password
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={12}
+                  maxLength={72}
+                  required
+                  value={newAdminPassword}
+                  onChange={event => setNewAdminPassword(event.target.value)}
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm normal-case tracking-normal text-slate-900"
+                />
+              </label>
+              <label className="block text-xs font-bold uppercase tracking-wide text-slate-500">
+                Confirm new password
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={12}
+                  maxLength={72}
+                  required
+                  value={confirmAdminPassword}
+                  onChange={event => setConfirmAdminPassword(event.target.value)}
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm normal-case tracking-normal text-slate-900"
+                />
+              </label>
+              {adminSetupError && <p role="alert" className="text-sm text-red-600">{adminSetupError}</p>}
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-xl bg-[#173b32] py-3 text-sm font-bold text-white disabled:opacity-50"
+              >
+                {loading ? 'Saving...' : 'Save new password'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleAdminLogin} className="space-y-4">
+              <label className="block text-xs font-bold uppercase tracking-wide text-slate-500">
+                Username
+                <input
+                  type="text"
+                  autoComplete="username"
+                  value="admin"
+                  readOnly
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-100 px-4 py-3 text-sm text-slate-700"
+                />
+              </label>
+              <label className="block text-xs font-bold uppercase tracking-wide text-slate-500">
+                Password
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={loginPassword}
+                  onChange={event => setLoginPassword(event.target.value)}
+                  className="mt-2 w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900"
+                />
+              </label>
+              {adminSetupError && <p role="alert" className="text-sm text-red-600">{adminSetupError}</p>}
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-xl bg-[#173b32] py-3 text-sm font-bold text-white disabled:opacity-50"
+              >
+                {loading ? 'Signing in...' : 'Admin sign in'}
+              </button>
+            </form>
+          )}
+        </section>
+      </main>
+      </>
+    );
+  }
+
+  return (
+    <LocalizationContext.Provider value={localization}>
+    <div className="velqra-storefront min-h-screen text-neutral-100 font-sans antialiased flex flex-col">
+      {toast.show && (
+        <div className={`fixed top-20 left-1/2 transform -translate-x-1/2 z-[120] px-6 py-3 rounded-xl shadow-lg text-white font-bold text-sm transition-all ${
+          toast.type === 'success' ? 'bg-green-500' :
+          toast.type === 'error' ? 'bg-red-500' : 'bg-blue-500'
+        }`}>
+          {toast.message}
+        </div>
+      )}
+
+      {!isUserAuthPage && !isCartOpen && (
+      <>
+      <div className="announcement-bar" role="region" aria-label="VELQRA announcement">
+        <div className="announcement-track">
+          {Array.from({ length: 2 }).map((_, copy) => (
+            <div key={copy} className="announcement-content" aria-hidden={copy === 1}>
+              <span>START SHOPPING WITH VELQRA</span>
+              <span className="announcement-star">✦</span>
+              <strong>BUY NOW</strong>
+              <span className="announcement-star">✦</span>
+              <span>PREMIUM QUALITY. EVERYDAY VALUE.</span>
+              <span className="announcement-star">✦</span>
+            </div>
+          ))}
+        </div>
+        <div className="announcement-socials">
+          <a href="https://www.instagram.com/officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on Instagram" title="Instagram @officialvelqra">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="5" fill="none" stroke="currentColor" strokeWidth="2" />
+              <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" strokeWidth="2" />
+              <circle cx="17.2" cy="6.8" r="1.2" fill="currentColor" />
+            </svg>
+          </a>
+          <a href="https://www.facebook.com/officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on Facebook" title="Facebook @officialvelqra">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path fill="currentColor" d="M13.7 21v-8h2.7l.4-3h-3.1V8.1c0-.9.2-1.5 1.6-1.5h1.7V3.9c-.3 0-1.3-.1-2.5-.1-2.5 0-4.2 1.5-4.2 4.3V10H7.6v3h2.7v8h3.4z" />
+            </svg>
+          </a>
+          <a href="https://www.youtube.com/@officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on YouTube" title="YouTube @officialvelqra">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path fill="currentColor" d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8zM9.6 15.6V8.4l6.2 3.6-6.2 3.6z" />
+            </svg>
+          </a>
+        </div>
+      </div>
+      <header className="velqra-main-header sticky top-[30px] z-[70] flex items-center justify-between border-b border-neutral-200 bg-white px-4 py-3 shadow-sm backdrop-blur-md sm:px-6 sm:py-4">
+        <div className={`flex items-center gap-3 sm:gap-5 ${location.pathname === '/' ? 'pl-12 md:pl-0' : ''}`}>
+          {location.pathname !== '/' && (
+            <button type="button" onClick={() => navigate(-1)} className="grid h-9 w-9 place-items-center text-neutral-900" aria-label="Go back">
+              <svg className="h-7 w-7 fill-none stroke-current" viewBox="0 0 24 24" strokeWidth="1.8">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+          )}
+          <Link to="/" className="flex items-center gap-2" aria-label="VELQRA home">
+            <img src={velqraLogo} alt="" className="header-brand-image" />
+            <span className="font-serif text-xl font-bold tracking-[0.08em] text-[#173b32] sm:text-2xl" aria-label="VELQRA">
+              VELQRA<sup className="ml-0.5 text-[8px] font-normal text-[#d4af37]">™</sup>
+            </span>
+          </Link>
+        </div>
+
+        <HeaderSearchForm
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          suggestions={searchSuggestions}
+          onSubmit={submitHeaderSearch}
+          formatPrice={formatPrice}
+          t={t}
+          className="velqra-desktop-search max-w-xl flex-1 lg:mx-5"
+        />
+
+        <div className="hidden items-center gap-2 md:flex">
+          {isUserLoggedIn ? (
+            <div className="flex items-center gap-2">
+              <span className="max-w-28 truncate text-xs font-bold uppercase tracking-wide text-neutral-700 sm:max-w-40">
+                {currentUser?.name || currentUser?.email || 'Account'}
+              </span>
+              <button
+                type="button"
+                onClick={isAdminLoggedIn ? handleAdminLogout : handleUserLogout}
+                className="velqra-header-login inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-neutral-800 sm:px-4"
+              >
+                {t('Logout').toUpperCase()}
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => openUserAuth('login')}
+              className="velqra-header-login inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-neutral-800 sm:px-4"
+            >
+              {t('Login').toUpperCase()}
+            </button>
+          )}
+          {isUserLoggedIn && orders.length > 0 ? (
+            <Link to="/orders" className="text-xs font-bold uppercase tracking-wide text-neutral-700">{t('Orders')}</Link>
+          ) : null}
+          {totalCartItems > 0 && (
+            <button
+              type="button"
+              onClick={openCart}
+              className="hidden text-xs font-bold uppercase tracking-wide text-[#173b32] sm:inline"
+            >
+              {t('ORDER')}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={openCart}
+            className="velqra-bag-button relative flex items-center gap-2 rounded-full border px-4 py-2 transition"
+            aria-label={`${t('BAG')}${totalCartItems > 0 ? `, ${totalCartItems}` : ''}`}
+          >
+            <svg aria-hidden="true" className="h-5 w-5 fill-none stroke-current" viewBox="0 0 24 24" strokeWidth="1.8">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+            </svg>
+            <span className="text-sm font-medium">{t('BAG').toUpperCase()}</span>
+            {totalCartItems > 0 && (
+              <span className="velqra-bag-count">
+                {totalCartItems}
+              </span>
+            )}
+          </button>
+          <LocaleControls
+            language={language}
+            currency={currency}
+            onLanguageChange={setLanguage}
+            onCurrencyChange={setCurrency}
+          />
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            setIsHeaderSearchOpen(open => !open);
+            setIsMobileMenuOpen(false);
+          }}
+          aria-label={t(isHeaderSearchOpen ? 'Close search' : 'Search products')}
+          aria-expanded={isHeaderSearchOpen}
+          aria-controls="mobile-catalog-search"
+          className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-neutral-300 bg-white text-neutral-800 transition hover:border-[#173b32] hover:text-[#173b32] focus:outline-none focus:ring-2 focus:ring-[#173b32] lg:hidden"
+        >
+          <svg aria-hidden="true" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="10.8" cy="10.8" r="6.8" />
+            <path strokeLinecap="round" d="m16 16 4.5 4.5" />
+          </svg>
+        </button>
+
+        {location.pathname === '/' && (
+          <button
+            type="button"
+            onClick={() => {
+              setIsMobileMenuOpen(open => !open);
+              setIsHeaderSearchOpen(false);
+            }}
+            className="absolute left-3 top-3 z-[45] grid h-10 w-10 place-items-center rounded-full border border-neutral-300 bg-white text-neutral-900 md:hidden"
+            aria-label={isMobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+            aria-expanded={isMobileMenuOpen}
+          >
+            <svg className="h-5 w-5 fill-none stroke-current" viewBox="0 0 24 24" strokeWidth="2">
+              {isMobileMenuOpen ? (
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              ) : (
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+              )}
+            </svg>
+          </button>
+        )}
+
+        {location.pathname === '/' && isMobileMenuOpen && (
+          <>
+            <nav
+              className="velqra-mobile-nav absolute left-[-12px] right-[-12px] top-full z-[42] flex flex-col bg-[#fdfcf9] md:hidden"
+              style={{ backgroundColor: '#fdfcf9', color: '#173b32' }}
+              aria-label="Mobile navigation"
+            >
+              <div className="flex h-[72px] shrink-0 items-center justify-between border-b border-[#d9d8d2] px-6">
+                <span className="text-2xl font-semibold tracking-[0.08em] text-[#173b32]">{t('MENU')}</span>
+                <button
+                  type="button"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="grid h-10 w-10 place-items-center text-[#173b32]"
+                  aria-label="Close navigation menu"
+                >
+                  <svg className="h-8 w-8 fill-none stroke-current" viewBox="0 0 24 24" strokeWidth="1.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="shrink-0 border-b border-[#e1e0da] px-6 py-3">
+                <LocaleControls
+                  compact
+                  className="w-full justify-between"
+                  language={language}
+                  currency={currency}
+                  onLanguageChange={setLanguage}
+                  onCurrencyChange={setCurrency}
+                />
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto px-6 py-2">
+                {[
+                  [t('Shop'), '/'],
+                  [t('Face Wash'), '/#products'],
+                  [t('Orders'), '/orders']
+                ].map(([label, to]) => (
+                  <Link
+                    key={label}
+                    to={to}
+                    onClick={() => setIsMobileMenuOpen(false)}
+                    className="block border-b border-[#e1e0da] py-[18px] text-xl font-medium leading-tight text-[#173b32]"
+                  >
+                    {label}
+                  </Link>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMobileMenuOpen(false);
+                    openCart();
+                  }}
+                  className="block w-full border-b border-[#e1e0da] py-[18px] text-left text-xl font-medium leading-tight text-[#173b32]"
+                >
+                  {t('Cart')}{totalCartItems > 0 ? ` (${totalCartItems})` : ''}
+                </button>
+                <div className="pt-5">
+                  <button
+                    type="button"
+                    onClick={() => setIsMobilePoliciesOpen((open) => !open)}
+                    className="flex w-full items-center justify-between border-b border-[#e1e0da] py-[18px] text-left text-xl font-medium leading-tight text-[#173b32]"
+                    aria-expanded={isMobilePoliciesOpen}
+                  >
+                    Privacy
+                    <span className="text-base">{isMobilePoliciesOpen ? '−' : '+'}</span>
+                  </button>
+                  {isMobilePoliciesOpen && (
+                    <div className="flex flex-col py-2 text-xs text-[#777b74]">
+                      {[
+                        ['Shipping Policy', '/shipping-policy'],
+                        ['Privacy Policy', '/privacy-policy'],
+                        ['Terms & Conditions', '/terms-policy'],
+                        ['Return & Refund Policy', '/return-refund-policy'],
+                        ['Contact Policy', '/contact-policy']
+                      ].map(([label, to]) => (
+                        <Link
+                          key={to}
+                          to={to}
+                          onClick={() => {
+                            setIsMobilePoliciesOpen(false);
+                            setIsMobileMenuOpen(false);
+                          }}
+                          className="border-b border-[#eeeae2] py-3"
+                        >
+                          {label}
+                        </Link>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <Link
+                  to="/contact-policy"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="block border-b border-[#e1e0da] py-[18px] text-xl font-medium leading-tight text-[#173b32]"
+                >
+                  Support Team
+                </Link>
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setIsMobileSocialOpen((open) => !open)}
+                    className="flex w-full items-center justify-between border-b border-[#e1e0da] py-[18px] text-left text-xl font-medium text-[#173b32]"
+                    aria-expanded={isMobileSocialOpen}
+                  >
+                    Social Contact
+                    <span className="text-base">{isMobileSocialOpen ? '−' : '+'}</span>
+                  </button>
+                  {isMobileSocialOpen && (
+                    <div className="flex flex-col text-sm text-[#777b74]">
+                      <a href="https://www.youtube.com/@officialvelqra" target="_blank" rel="noreferrer" className="border-b border-[#eeeae2] py-3">YouTube</a>
+                      <a href="https://www.instagram.com" target="_blank" rel="noreferrer" className="border-b border-[#eeeae2] py-3">Instagram</a>
+                      <a href="https://www.facebook.com" target="_blank" rel="noreferrer" className="border-b border-[#eeeae2] py-3">Facebook</a>
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMobileMenuOpen(false);
+                    if (isUserLoggedIn) {
+                      if (isAdminLoggedIn) {
+                        handleAdminLogout();
+                      } else {
+                        handleUserLogout();
+                      }
+                    } else {
+                      openUserAuth('login');
+                    }
+                  }}
+                  className="block w-full border-b border-[#e1e0da] py-[18px] text-left text-xl font-medium leading-tight text-[#173b32]"
+                >
+                  {t(isUserLoggedIn ? 'Logout' : 'Login')}
+                </button>
+              </div>
+            </nav>
+          </>
+        )}
+
+        {isHeaderSearchOpen && (
+          <div
+            id="mobile-catalog-search"
+            className="absolute left-0 right-0 top-full z-[71] border-y border-neutral-200 bg-white/95 px-4 py-3 shadow-lg backdrop-blur-md lg:hidden"
+          >
+            <HeaderSearchForm
+              searchQuery={searchQuery}
+              onSearchChange={setSearchQuery}
+              suggestions={searchSuggestions}
+              onSubmit={submitHeaderSearch}
+              formatPrice={formatPrice}
+              t={t}
+              autoFocus
+              className="w-full"
+            />
+          </div>
+        )}
+
+      </header>
+
+      {!isMobileMenuOpen && (
+      <div className="flex justify-end border-b border-neutral-200 bg-white px-4 py-2 md:hidden">
+        <LocaleControls
+          compact
+          language={language}
+          currency={currency}
+          onLanguageChange={setLanguage}
+          onCurrencyChange={setCurrency}
+        />
+      </div>
+      )}
+
+      {(currency !== 'INR' || exchangeRateStatus === 'stale' || exchangeRateStatus === 'partial') && (
+        <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-center text-xs text-amber-900" role="status">
+          <p>{t('Displayed prices use reference rates; checkout is charged in INR.')}</p>
+          {currency !== 'INR' && !selectedCurrencyAvailable && exchangeRateStatus === 'loading' && (
+            <p>{t('Loading exchange rates...')}</p>
+          )}
+          {currency !== 'INR' && !selectedCurrencyAvailable && exchangeRateStatus !== 'loading' && (
+            <p>{t('Selected currency rates are unavailable. Prices cannot be converted.')}</p>
+          )}
+          {exchangeRateStatus === 'stale' && selectedCurrencyAvailable && (
+            <p>{t('Exchange rates could not be refreshed. Showing saved reference rates.')}</p>
+          )}
+          {exchangeRateStatus === 'partial' && selectedCurrencyAvailable && (
+            <p>{t('Some exchange rates are unavailable. Choose another currency or INR.')}</p>
+          )}
+          {exchangeRateDate && selectedCurrencyAvailable && (
+            <p>{t('Reference rate date: {date}', { date: exchangeRateDate })}</p>
+          )}
+        </div>
+      )}
+      </>
+      )}
+
+      {/* MAIN CONTENT */}
+      {!isUserAuthPage && !isCartOpen && (
+      <div className="flex-1 bg-[#f1f1ef] text-[#171717]">
+        <Routes>
+          <Route path="/" element={
+            <>
+              {(() => {
+                return (
+                  <main className="bg-[#f1f1ef] text-[#171717]">
+                    {!normalizedSearch && (
+                      <section className="velqra-home-hero">
+                        <video
+                          className="velqra-hero-image"
+                          src="/banner-video.mp4"
+                          autoPlay
+                          muted
+                          loop
+                          playsInline
+                          preload="metadata"
+                          aria-hidden="true"
+                          onPlay={() => {
+                            heroVideoReachedEndRef.current = false;
+                            setHeroVideoCycle(cycle => cycle + 1);
+                          }}
+                          onTimeUpdate={event => {
+                            const video = event.currentTarget;
+                            if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+
+                            const loopBoundary = Math.min(0.75, video.duration / 4);
+                            if (video.currentTime >= video.duration - loopBoundary) {
+                              heroVideoReachedEndRef.current = true;
+                            } else if (heroVideoReachedEndRef.current && video.currentTime <= loopBoundary) {
+                              heroVideoReachedEndRef.current = false;
+                              setHeroVideoCycle(cycle => cycle + 1);
+                            }
+                          }}
+                        />
+                        <div className="velqra-home-hero-cta">
+                          <RoutineFinder
+                            products={products}
+                            t={t}
+                            formatCurrency={formatPrice}
+                            animationCycle={heroVideoCycle}
+                          />
+                        </div>
+                      </section>
+                    )}
+                    <section id="products" className="scroll-mt-40 max-w-7xl mx-auto px-4 pb-8 pt-4 sm:px-6 sm:py-14" data-reveal>
+                      <div className="mb-5 rounded-xl border border-[#d9d9d4] bg-white p-3 sm:mb-8 sm:p-5">
+                        <div role="group" aria-label={t('Category filter')} className="flex flex-wrap items-center gap-2">
+                            {[
+                              { value: 'All', label: t('All') },
+                              { value: 'Face Wash', label: t('Face Wash') }
+                            ].map(option => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => setActiveCategory(option.value)}
+                                aria-pressed={activeCategory === option.value}
+                                className={`min-h-10 rounded-full border px-5 text-sm font-bold transition focus:outline-none focus:ring-2 focus:ring-[#173b32] focus:ring-offset-2 ${
+                                  activeCategory === option.value
+                                    ? 'border-[#173b32] bg-[#173b32] text-white shadow-sm'
+                                    : 'border-[#d9d9d4] bg-white text-[#454640] hover:border-[#173b32] hover:text-[#173b32]'
+                                }`}
+                              >
+                                {option.label}
+                              </button>
+                            ))}
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-xs text-[#73736c]">
+                          <span>{t('Showing {count} of {total} products', { count: filteredProducts.length, total: products.length })}</span>
+                          {searchQuery && <span className="max-w-full truncate">{t('Search:')} {searchQuery}</span>}
+                        </div>
+                      </div>
+                      {catalogLoading && products.length === 0 ? (
+                        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 sm:gap-6 lg:grid-cols-4" aria-label={t('Loading products')} aria-busy="true">
+                          {Array.from({ length: 4 }).map((_, index) => (
+                            <div key={index} className="velqra-product-skeleton velqra-product-grid-card" aria-hidden="true">
+                              <div className="velqra-skeleton-image" />
+                              <div className="velqra-skeleton-line velqra-skeleton-short" />
+                              <div className="velqra-skeleton-line" />
+                              <div className="velqra-skeleton-line velqra-skeleton-price" />
+                            </div>
+                          ))}
+                        </div>
+                      ) : catalogError && products.length === 0 ? (
+                        <div role="alert" className="rounded-lg border border-amber-200 bg-white py-12 text-center">
+                          <p className="font-serif text-xl text-slate-800">{t('Products could not be loaded')}</p>
+                          <p className="mt-2 text-sm text-slate-500">{catalogError}</p>
+                          <button
+                            type="button"
+                            onClick={() => void fetchProducts()}
+                            className="mt-5 rounded-lg bg-[#173b32] px-5 py-2 text-sm font-bold text-white hover:bg-[#102a24]"
+                          >
+                            {t('Try again')}
+                          </button>
+                        </div>
+                      ) : filteredProducts.length === 0 ? (
+                        <div className="rounded-lg border border-neutral-200 bg-white py-16 text-center">
+                          <p className="font-serif text-2xl">
+                            {t(products.length === 0 ? 'No products available' : 'No products match your filters')}
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 sm:gap-6 lg:grid-cols-4">
+                          {filteredProducts.map(product => {
+                            const price = Number(product.price || 0);
+                            const originalPrice = Number(product.originalPrice || price);
+                            const discount = Number(product.discountPercent || 0);
+                            const actualReviewsCount = Number(product.reviewsCount ?? product.reviews_count ?? 0);
+                            const demoReviewSummary = getDemoReviewSummary(product);
+                            const rating = actualReviewsCount ? Number(product.rating || 0) : demoReviewSummary.rating;
+                            const reviewsCount = actualReviewsCount || demoReviewSummary.reviewsCount;
+                            return (
+                              <div key={product._id} className="velqra-product-grid-card group" data-reveal>
+                                <Link to={`/product/${product._id}`} className="block">
+                                  <div className="velqra-product-card-media relative">
+                                    {discount > 0 && <span className="velqra-product-discount">{discount}% OFF</span>}
+                                    <HomeProductMedia product={product} />
+                                    {product.stock <= 0 && (
+                                      <div
+                                        role="status"
+                                        aria-label={t('Out of Stock')}
+                                        className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black/35"
+                                      >
+                                        <span className="rounded-full bg-red-700 px-4 py-2 text-xs font-black uppercase tracking-wider text-white shadow-lg sm:text-sm">
+                                          {t('Out of Stock')}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="p-3 sm:p-5">
+                                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-[#8a8a82]">{product.category || 'Botanical'}</p>
+                                    <h2 className="mt-2 min-h-[44px] font-serif text-base sm:text-xl leading-tight text-[#1d1d1b]">{product.name}</h2>
+                                    <div className="mt-4 flex items-baseline gap-2">
+                                      <strong className="text-base sm:text-lg text-[#173b32]">{formatPrice(price)}</strong>
+                                      {originalPrice > price && <span className="text-xs text-[#999] line-through">{formatPrice(originalPrice)}</span>}
+                                    </div>
+                                  </div>
+                                </Link>
+                                <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3 py-3 sm:px-5">
+                                  <div className="flex min-w-0 items-center gap-1.5">
+                                    <ReviewStars value={rating} size="text-sm" />
+                                    <span className="text-xs font-bold text-slate-600">{rating ? rating.toFixed(1) : '—'}</span>
+                                    {demoReviewSummary.reviewsCount > 0 && (
+                                      <span className="text-[9px] font-black uppercase tracking-wide text-amber-700">Demo</span>
+                                    )}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => setActiveReviewsProduct(product)}
+                                    className="shrink-0 rounded-full border border-[#173b32] px-3 py-1.5 text-[10px] font-bold uppercase tracking-wide text-[#173b32] transition hover:bg-[#173b32] hover:text-white"
+                                  >
+                                    {t('All reviews')} ({reviewsCount})
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  </main>
+                );
+              })()}
+            </>
+          } />
+
+          <Route path="/product/:id" element={<ProductDetailPage
+            addToCart={addToCart}
+            openCheckout={() => {
+              openCart();
+              setCheckoutOpen(true);
+            }}
+            onOpenReviews={setActiveReviewsProduct}
+            onReviewSummaryUpdated={updateProductReviewSummary}
+          />} />
+          <Route path="/about" element={<AboutPage />} />
+          <Route path="/privacy-policy" element={<PolicyPage policy="privacy" />} />
+          <Route path="/terms-policy" element={<PolicyPage policy="terms" />} />
+          <Route path="/return-refund-policy" element={<PolicyPage policy="returns" />} />
+          <Route path="/shipping-policy" element={<PolicyPage policy="shipping" />} />
+          <Route path="/contact-policy" element={<PolicyPage policy="contact" />} />
+          <Route path="/auth" element={<Navigate to="/login" replace />} />
+          <Route path="/login" element={<main className="min-h-screen" />} />
+          <Route path="/register" element={<main className="min-h-screen" />} />
+          <Route path="/admin/login" element={
+            isAdminLoggedIn ? <Navigate to="/admin" replace /> : <main className="min-h-[50vh]" />
+          } />
+
+          <Route path="/orders" element={<OrdersPage
+            onLoginRequest={() => openUserAuth('login')}
+            onOpenReviews={setActiveReviewsProduct}
+          />} />
+          <Route path="/orders/track/:orderId" element={<OrderTracking />} />
+
+          <Route path="/admin" element={
+            isAdminLoggedIn ? (
+              <main className="velqra-admin-shell container mx-auto max-w-6xl px-4 py-8 space-y-8 text-slate-900">
+                <div className="flex flex-col md:flex-row items-start md:items-center justify-between border-b border-slate-200 pb-4 gap-3">
+                  <div>
+                    <h1 className="text-2xl font-black text-slate-900 tracking-tight flex items-center gap-2">
+                      🛠️ Admin Panel
+                      <span className="text-xs font-normal bg-green-100 text-green-700 px-3 py-1 rounded-full">Live</span>
+                    </h1>
+                    <p className="text-xs text-slate-500 mt-1">Manage your product catalog</p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="bg-[#0B3C5D]/10 text-[#0B3C5D] font-bold text-xs px-3 py-1.5 rounded-lg">
+                      📊 {products.length} Items
+                    </span>
+                  </div>
+                </div>
+
+                <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <h2 className="text-sm font-extrabold text-slate-800">Admin mobile number</h2>
+                  <p className="mt-1 text-xs text-slate-500">Save the mobile number associated with this admin account.</p>
+                  <form onSubmit={handleAdminPhoneSave} className="mt-4 flex flex-col gap-3 sm:flex-row">
+                    <input
+                      type="tel"
+                      inputMode="numeric"
+                      autoComplete="tel"
+                      maxLength={10}
+                      pattern="[6-9][0-9]{9}"
+                      required
+                      value={adminPhone}
+                      onChange={event => setAdminPhone(event.target.value.replace(/\D/g, '').slice(0, 10))}
+                      placeholder="10-digit mobile number"
+                      aria-label="Admin mobile number"
+                      className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-900"
+                    />
+                    <button
+                      type="submit"
+                      disabled={adminPhoneLoading || adminPhoneSaving}
+                      className="rounded-xl bg-[#173b32] px-5 py-3 text-sm font-bold text-white disabled:opacity-50"
+                    >
+                      {adminPhoneLoading ? 'Loading...' : adminPhoneSaving ? 'Saving...' : 'Save mobile number'}
+                    </button>
+                  </form>
+                  {adminPhoneError && <p role="alert" className="mt-2 text-sm text-red-600">{adminPhoneError}</p>}
+                </section>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+                  {/* Add Product Form */}
+                  <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm sticky top-24">
+                    <h3 className="font-extrabold text-base text-slate-800 mb-4">➕ Add Product</h3>
+
+                    <form onSubmit={handleAddProduct} className="space-y-4 max-h-[80vh] overflow-y-auto pr-2">
+                      {/* Product Name */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Product Name *</label>
+                        <input
+                          type="text"
+                          value={newProdName}
+                          onChange={(e) => setNewProdName(e.target.value)}
+                          placeholder="e.g., iPhone 15, Men's T-Shirt"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                          required
+                        />
+                      </div>
+
+                      {/* Price & Discount */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Original Price *</label>
+                          <input
+                            type="number"
+                            value={newProdOriginalPrice}
+                            onChange={(e) => setNewProdOriginalPrice(e.target.value)}
+                            placeholder="₹"
+                            className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Discount %</label>
+                          <input
+                            type="number"
+                            value={newProdDiscount}
+                            onChange={(e) => setNewProdDiscount(e.target.value)}
+                            placeholder="0"
+                            min="0"
+                            max="100"
+                            className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Selling Price Preview */}
+                      {newProdOriginalPrice && (
+                        <div className="text-[11px] text-green-600 font-bold bg-green-50 p-3 rounded-xl border border-green-100 flex justify-between">
+                          <span>🏷️ Selling Price:</span>
+                          <span>₹{Math.round(parseFloat(newProdOriginalPrice) - (parseFloat(newProdOriginalPrice) * ((parseFloat(newProdDiscount) || 0) / 100)))}</span>
+                        </div>
+                      )}
+
+                      {/* Product Promo */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Promo Code</label>
+                          <input
+                            value={newProdPromoCode}
+                            onChange={(e) => setNewProdPromoCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+                            placeholder="AJAY10"
+                            className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Promo Discount %</label>
+                          <input
+                            type="number"
+                            value={newProdPromoDiscount}
+                            onChange={(e) => setNewProdPromoDiscount(e.target.value)}
+                            min="0"
+                            max="100"
+                            placeholder="Optional"
+                            className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Category & Stock */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Category *</label>
+                          <select
+                            value={newProdCategory}
+                            onChange={(e) => setNewProdCategory(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                          >
+                            {categories.filter(c => c !== 'All').map(cat => (
+                              <option key={cat} value={cat}>{cat}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Stock</label>
+                          <input
+                            type="number"
+                            value={newProdStock}
+                            onChange={(e) => setNewProdStock(e.target.value)}
+                            min="0"
+                            className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Image URL */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Product Image *</label>
+                        <input
+                          type="url"
+                          value={newProdImageUrl}
+                          onChange={(e) => {
+                            setNewProdImageUrl(e.target.value);
+                            setNewProdImageFile('');
+                          }}
+                          placeholder="https://example.com/product-image.jpg"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                          required={
+                            !newProdImageFile &&
+                            !newProdVideoUrl &&
+                            newProdUploadedImages.length === 0 &&
+                            !newProdImages.trim()
+                          }
+                        />
+                        <div className="flex items-center gap-2 my-2 text-[10px] text-slate-400">
+                          <span className="h-px flex-1 bg-slate-200" />
+                          OR
+                          <span className="h-px flex-1 bg-slate-200" />
+                        </div>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={handleProductImageUpload}
+                          className="w-full text-xs file:mr-3 file:rounded-lg file:border-0 file:bg-[#0B3C5D] file:px-3 file:py-2 file:text-xs file:font-bold file:text-white"
+                        />
+                        {newProdImageUrl && (
+                          <div className="mt-2">
+                            <img
+                              src={newProdImageUrl}
+                              alt="Preview"
+                              className="h-16 w-16 object-cover rounded-lg border border-slate-200"
+                              onError={(e) => {
+                                e.target.onerror = null;
+                                e.target.src = 'https://via.placeholder.com/64/FF5722/FFFFFF?text=Invalid+URL';
+                              }}
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">
+                          Add Multiple Product Images
+                        </label>
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          multiple
+                          onChange={handleProductImagesUpload}
+                          disabled={uploadingProductImages}
+                          className="w-full text-xs file:mr-3 file:rounded-lg file:border-0 file:bg-[#0B3C5D] file:px-3 file:py-2 file:text-xs file:font-bold file:text-white disabled:opacity-50"
+                        />
+                        <p className="mt-1 text-[10px] text-slate-400">
+                          Select as many JPG, PNG, or WebP images as needed. Each image can be up to 5 MB.
+                        </p>
+                        {uploadingProductImages && (
+                          <p role="status" className="mt-2 text-xs font-semibold text-[#0B3C5D]">
+                            Uploading product images...
+                          </p>
+                        )}
+                        {newProdUploadedImages.length > 0 && (
+                          <div className="mt-2 grid grid-cols-4 gap-2">
+                            {newProdUploadedImages.map((imageUrl, index) => (
+                              <img
+                                key={`${imageUrl}-${index}`}
+                                src={imageUrl}
+                                alt={`Additional product image ${index + 1}`}
+                                className="h-16 w-full rounded-lg border border-slate-200 object-cover"
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Additional Images */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Additional Image URLs (optional)</label>
+                        <input
+                          type="text"
+                          value={newProdImages}
+                          onChange={(e) => setNewProdImages(e.target.value)}
+                          placeholder="https://example.com/img1.jpg, https://example.com/img2.jpg"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                        />
+                      </div>
+
+                      {/* Brand */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Brand</label>
+                        <input
+                          type="text"
+                          value={newProdBrand}
+                          onChange={(e) => setNewProdBrand(e.target.value)}
+                          placeholder="Brand name"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                        />
+                      </div>
+
+                      {/* Video URL or uploaded demo */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Product demo video</label>
+                        <input
+                          type="file"
+                          accept="video/mp4,video/webm,video/quicktime,video/ogg"
+                          onChange={handleProductVideoUpload}
+                          disabled={uploadingProductVideo}
+                          className="w-full text-xs file:mr-3 file:rounded-lg file:border-0 file:bg-[#0B3C5D] file:px-3 file:py-2 file:text-xs file:font-bold file:text-white disabled:opacity-50"
+                        />
+                        <p className="mt-1 text-[10px] text-slate-400">Upload MP4, WebM, MOV, or OGG (max 50 MB); the video appears in the product media gallery.</p>
+                        <div className="my-3 flex items-center gap-2 text-[10px] text-slate-400">
+                          <span className="h-px flex-1 bg-slate-200" />
+                          OR ADD A LINK
+                          <span className="h-px flex-1 bg-slate-200" />
+                        </div>
+                        <input
+                          type="url"
+                          value={newProdVideoUrl}
+                          onChange={(e) => {
+                            setNewProdVideoUrl(e.target.value);
+                            if (newProdVideoType === 'uploaded') setNewProdVideoType('youtube');
+                          }}
+                          placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition"
+                        />
+                        {newProdVideoUrl && newProdVideoType === 'uploaded' && (
+                          <video src={newProdVideoUrl} controls playsInline preload="metadata" className="mt-2 max-h-48 w-full rounded-lg bg-black" />
+                        )}
+                        {newProdVideoUrl && newProdVideoType !== 'uploaded' && (
+                          <div className="mt-2 text-[10px] text-green-600">
+                            ✅ Video URL added: {newProdVideoUrl}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Video Platform */}
+                      {newProdVideoType !== 'uploaded' && <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Video Platform</label>
+                        <select
+                          value={newProdVideoType}
+                          onChange={(e) => setNewProdVideoType(e.target.value)}
+                          className="w-full bg-slate-50 border border-slate-200 px-3 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        >
+                          <option value="youtube">YouTube</option>
+                          <option value="vimeo">Vimeo</option>
+                        </select>
+                      </div>}
+
+                      {/* Description */}
+                      <div>
+                        <label className="block text-xs font-bold uppercase text-slate-400 mb-1">Description</label>
+                        <textarea
+                          value={newProdDescription}
+                          onChange={(e) => setNewProdDescription(e.target.value)}
+                          placeholder="Detailed product description..."
+                          rows="3"
+                          className="w-full bg-slate-50 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D] focus:bg-white transition resize-none"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={loading || uploadingProductVideo || uploadingProductImages}
+                        className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-xs uppercase tracking-wider hover:bg-[#07263b] transition disabled:opacity-50"
+                      >
+                        {uploadingProductImages
+                          ? '⏳ Uploading images...'
+                          : uploadingProductVideo
+                            ? '⏳ Uploading video...'
+                            : loading
+                              ? '⏳ Processing...'
+                              : '🚀 Add Product'}
+                      </button>
+                    </form>
+                  </div>
+
+                  <div className="lg:col-span-2 space-y-6">
+                    {/* Orders Table */}
+                    <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+                      <div className="px-4 py-4 border-b border-slate-100 flex items-center justify-between">
+                        <h3 className="font-extrabold text-base text-slate-800">📦 Orders</h3>
+                        <span className="text-[10px] font-bold uppercase text-slate-400">{orders.length} total</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-100 text-slate-400 text-[10px] font-bold uppercase tracking-wider">
+                              <th className="py-3 px-4">Order ID</th>
+                              <th className="py-3 px-4">Customer</th>
+                              <th className="py-3 px-4">Payment</th>
+                              <th className="py-3 px-4">Total</th>
+                              <th className="py-3 px-4">Status</th>
+                              <th className="py-3 px-4">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-xs font-medium">
+                            {ordersLoading ? (
+                              <tr><td colSpan="6" className="py-8 text-center text-slate-400">Loading orders...</td></tr>
+                            ) : orders.length === 0 ? (
+                              <tr><td colSpan="6" className="py-8 text-center text-slate-400">No orders yet</td></tr>
+                            ) : (
+                              orders.map(order => (
+                                <tr key={order._id} className="hover:bg-slate-50/50 transition-colors">
+                                  <td className="py-3 px-4 font-bold text-slate-800">{order._id.slice(-6).toUpperCase()}</td>
+                                  <td className="py-3 px-4">
+                                    <div>
+                                      <div className="font-bold text-slate-800">{order.delivery?.fullName || 'Guest'}</div>
+                                      <div className="text-[10px] text-slate-400">{order.delivery?.email}</div>
+                                    </div>
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <div className="text-slate-700">{order.paymentMethod === 'online' ? '📱 Online · PayU' : '💵 COD'}</div>
+                                    {order.referenceId && (
+                                      <div className="mt-1 max-w-36 break-all text-[9px] text-slate-400">
+                                        Txn: {order.referenceId}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="py-3 px-4 font-bold text-[#0B3C5D]">₹{order.total}</td>
+                                  <td className="py-3 px-4">
+                                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-bold uppercase ${
+                                      order.status === 'Delivered' ? 'bg-green-100 text-green-700' :
+                                      order.status === 'Cancelled' ? 'bg-red-100 text-red-700' :
+                                      order.status === 'Shipped' ? 'bg-purple-100 text-purple-700' :
+                                      order.status === 'Payment Verified' ? 'bg-green-100 text-green-700' :
+                                      order.status === 'Payment Verification Pending' ? 'bg-orange-100 text-orange-700' :
+                                      order.status === 'Confirmed' ? 'bg-blue-100 text-blue-700' :
+                                      order.status === 'Pending' ? 'bg-yellow-100 text-yellow-700' :
+                                      'bg-slate-100 text-slate-700'
+                                    }`}>
+                                      {order.status === 'Payment Verification Pending' ? '⏳ Payment Pending' : order.status}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <div className="flex flex-col gap-1">
+                                      {isVerifiedOnlineOrder(order) && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handlePrintShippingLabel(order)}
+                                          className="rounded-lg bg-[#173b32] px-2 py-1 text-[10px] font-bold text-white"
+                                        >
+                                          Print shipping label
+                                        </button>
+                                      )}
+                                      {order.paymentMethod === 'online' &&
+                                        order.status === 'Payment Verification Pending' && order.referenceId && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleVerifyPayment(order._id)}
+                                            disabled={verifyingPaymentId === order._id}
+                                            className="rounded-lg bg-emerald-600 px-2 py-1 text-[10px] font-bold text-white disabled:opacity-50"
+                                          >
+                                            {verifyingPaymentId === order._id ? 'Checking PayU...' : 'Verify with PayU'}
+                                          </button>
+                                        )}
+                                      <select
+                                        value={order.status}
+                                        onChange={(e) => handleOrderStatusChange(order._id, e.target.value)}
+                                        className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-xs font-bold"
+                                      >
+                                        <option value="Pending">Pending</option>
+                                        <option value="Payment Verification Pending">Payment Pending</option>
+                                        <option value="Payment Verified">Payment Verified</option>
+                                        <option value="Confirmed">Confirmed</option>
+                                        <option value="Shipped">Shipped</option>
+                                        <option value="Delivered">Delivered</option>
+                                        <option value="Cancelled">Cancelled</option>
+                                      </select>
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Return Requests */}
+                    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+                      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-4">
+                        <h3 className="text-base font-extrabold text-slate-800">↩️ Return Requests</h3>
+                        <span className="text-[10px] font-bold uppercase text-slate-400">{returnRequests.length} total</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full border-collapse text-left">
+                          <thead>
+                            <tr className="border-b border-slate-100 bg-slate-50 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              <th className="px-4 py-3">Order / Items</th>
+                              <th className="px-4 py-3">Payment transaction</th>
+                              <th className="px-4 py-3">Refund</th>
+                              <th className="px-4 py-3">Status</th>
+                              <th className="px-4 py-3">Update</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-xs font-medium">
+                            {returnsLoading ? (
+                              <tr><td colSpan="5" className="py-8 text-center text-slate-400">Loading return requests...</td></tr>
+                            ) : returnRequests.length === 0 ? (
+                              <tr><td colSpan="5" className="py-8 text-center text-slate-400">No return requests</td></tr>
+                            ) : returnRequests.map(returnRequest => (
+                              <tr key={returnRequest.id}>
+                                <td className="px-4 py-3">
+                                  <div className="font-bold text-slate-800">#{returnRequest.orderId?.slice(-8).toUpperCase()}</div>
+                                  <div className="mt-1 text-[10px] text-slate-500">
+                                    {(returnRequest.items || []).map(item => `${item.name} ×${item.qty}`).join(', ')}
+                                  </div>
+                                  <div className="mt-1 text-[10px] text-slate-400">{returnRequest.reason}</div>
+                                </td>
+                                <td className="max-w-48 break-all px-4 py-3 text-[10px] text-slate-600">
+                                  {returnRequest.transactionId || 'COD return'}
+                                </td>
+                                <td className="px-4 py-3 font-bold text-[#0B3C5D]">₹{returnRequest.refundAmount}</td>
+                                <td className="px-4 py-3">{returnRequest.status}</td>
+                                <td className="px-4 py-3">
+                                  <select
+                                    value={returnRequest.status}
+                                    onChange={(e) => handleReturnStatusChange(returnRequest.id, e.target.value)}
+                                    disabled={updatingReturnId === returnRequest.id}
+                                    className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold disabled:opacity-50"
+                                  >
+                                    {['Pending', 'Approved', 'Pickup Scheduled', 'Item Received', 'Refund Initiated', 'Refunded', 'Rejected', 'Cancelled'].map(status => (
+                                      <option key={status} value={status}>{status}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="border-t border-slate-100 px-4 py-3 text-[10px] text-slate-500">
+                        For online payments, refund to the original payment method only after the returned item is received and inspected. Gateway/bank timing varies; do not promise a 5–10 minute settlement.
+                      </p>
+                    </div>
+
+                    {/* Products Table */}
+                    <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-100 text-slate-400 text-[10px] font-bold uppercase tracking-wider">
+                              <th className="py-3 px-4">Product</th>
+                              <th className="py-3 px-4 hidden sm:table-cell">Category</th>
+                              <th className="py-3 px-4">Price</th>
+                              <th className="py-3 px-4">Stock</th>
+                              <th className="py-3 px-4 text-right">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-xs font-medium">
+                            {products.length === 0 ? (
+                              <tr>
+                                <td colSpan="5" className="py-12 text-center text-slate-400">
+                                  <div className="text-4xl mb-2">📭</div>
+                                  No products
+                                </td>
+                              </tr>
+                            ) : (
+                              products.map(product => (
+                                <tr key={product._id} className="hover:bg-slate-50/50 transition-colors">
+                                  <td className="py-3 px-4">
+                                    <div className="flex items-center gap-3">
+                                      <img
+                                        src={getProductDisplayImage(product)}
+                                        alt={product.name}
+                                        className="h-8 w-8 object-cover rounded-lg"
+                                        loading="lazy"
+                                        onError={(e) => {
+                                          e.target.onerror = null;
+                                          e.target.src = getProductDisplayImage(product);
+                                        }}
+                                      />
+                                      <div>
+                                        <span className="font-bold text-slate-800 line-clamp-1 max-w-[120px]">{product.name}</span>
+                                        {product.attributes && Object.keys(product.attributes).length > 0 && (
+                                          <div className="text-[8px] text-slate-400">
+                                            {Object.keys(product.attributes).join(', ')}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td className="py-3 px-4 hidden sm:table-cell">
+                                    <span className="px-2 py-0.5 bg-slate-100 rounded text-[10px] uppercase font-bold text-slate-500">
+                                      {product.category}
+                                    </span>
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <div className="flex flex-col">
+                                      <span className="font-black text-[#0B3C5D]">₹{product.price}</span>
+                                      {product.discountPercent > 0 && (
+                                        <span className="text-[9px] text-slate-400 line-through">₹{product.originalPrice}</span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="py-3 px-4">
+                                    <div className="flex min-w-[190px] items-center gap-2">
+                                      <span className={`text-xs font-bold ${product.stock > 0 ? 'text-green-600' : 'text-red-500'}`}>
+                                        {product.stock > 0 ? product.stock : t('Out of Stock')}
+                                      </span>
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        step="1"
+                                        aria-label={`Stock for ${product.name}`}
+                                        value={productStockDrafts[product._id] ?? String(product.stock)}
+                                        onChange={event => setProductStockDrafts(currentDrafts => ({
+                                          ...currentDrafts,
+                                          [product._id]: event.target.value
+                                        }))}
+                                        className="w-20 rounded-lg border border-slate-200 px-2 py-1 text-sm text-slate-800"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => handleUpdateProductStock(product)}
+                                        disabled={stockUpdatingId === product._id}
+                                        className="rounded-lg bg-[#0B3C5D] px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-[#07263b] disabled:opacity-50"
+                                      >
+                                        {stockUpdatingId === product._id ? 'Saving...' : 'Save'}
+                                      </button>
+                                    </div>
+                                  </td>
+                                  <td className="py-3 px-4 text-right">
+                                    <button
+                                      onClick={() => handleDeleteProduct(product._id)}
+                                      className="text-red-500 hover:bg-red-50 px-2.5 py-1.5 rounded-lg font-bold transition"
+                                    >
+                                      🗑️
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </main>
+            ) : (
+              <Navigate to="/admin/login" replace />
+            )
+          } />
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </div>
+      )}
+
+      {activeReviewsProduct && (
+        <ProductReviewsModal
+          product={activeReviewsProduct}
+          onClose={() => setActiveReviewsProduct(null)}
+          onLoginRequest={() => {
+            setPendingReviewProduct(activeReviewsProduct);
+            openUserAuth('login');
+          }}
+          onReviewsUpdated={updateProductReviewSummary}
+        />
+      )}
+
+      {/* USER AUTH MODAL */}
+      {isAuthModalOpen && isUserAuthPage && (
+        <div
+          className="fixed inset-0 z-[100] flex min-h-screen items-center justify-center overflow-y-auto bg-[#f1f1ef] p-4 sm:p-8"
+        >
+          <div
+            className="velqra-auth-modal relative max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl p-6"
+          >
+            <button
+              onClick={() => {
+                sessionStorage.setItem('velqra_login_prompt_seen', 'true');
+                setIsAuthModalOpen(false);
+                navigate('/');
+              }}
+              className="absolute top-4 right-4 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+
+            <div className="mb-5 flex items-center justify-center" aria-label="VELQRA">
+              <img src={velqraLogo} alt="VELQRA" className="h-16 w-16 object-contain" />
+            </div>
+
+            {userAuthMode === 'login' ? (
+              // LOGIN
+              <>
+                <h3 className="text-lg font-black text-[#0B3C5D] mb-1">Welcome Back!</h3>
+                <p className="text-[11px] text-slate-400 mb-4">Login to your account to continue shopping</p>
+
+                {error && (
+                  <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                    {error}
+                  </div>
+                )}
+
+                <form onSubmit={handleUserLogin} className="space-y-3.5">
+                  <input
+                    type="text"
+                    required
+                    value={userEmail}
+                    onChange={(e) => setUserEmail(e.target.value)}
+                    autoComplete="username"
+                    placeholder="Email address or mobile number"
+                    className="w-full bg-slate-50 border px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                  />
+                  <input
+                    type="password"
+                    required
+                    value={userPassword}
+                    onChange={(e) => setUserPassword(e.target.value)}
+                    placeholder="Password"
+                    className="w-full bg-slate-50 border px-4 py-2.5 rounded-xl text-sm focus:outline-none focus:border-[#0B3C5D]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAuthModalOpen(false);
+                      setIsForgotPasswordOpen(true);
+                    }}
+                    className="text-[10px] text-[#0B3C5D] font-bold hover:underline block text-right"
+                  >
+                    Forgot Password?
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-sm hover:bg-[#07263b]"
+                  >
+                    {loading ? '⏳ Processing...' : 'Login'}
+                  </button>
+                </form>
+
+                <div className="mt-4 text-center text-[10px] text-slate-400">
+                  Don't have an account?{' '}
+                  <button
+                    onClick={() => {
+                      setRegStep('form');
+                      setError('');
+                      setRegName('');
+                      setRegEmail('');
+                      setRegPhone('');
+                      setRegPassword('');
+                      setRegConfirmPassword('');
+                      setRegSmsOtp('');
+                      openUserAuth('register');
+                    }}
+                    className="font-bold text-[#0B3C5D] hover:underline"
+                  >
+                    Sign Up
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sessionStorage.setItem('velqra_login_prompt_seen', 'true');
+                    setIsAuthModalOpen(false);
+                    navigate('/');
+                  }}
+                  className="mt-4 w-full border-t border-slate-100 pt-4 text-center text-xs font-bold text-slate-500 hover:text-[#173b32]"
+                >
+                  Continue without login
+                </button>
+              </>
+            ) : regStep === 'form' ? (
+              // REGISTER - Step 1: Form
+              <>
+                <h3 className="text-lg font-black text-[#0B3C5D] mb-1">Create Account</h3>
+                <p className="text-[11px] text-slate-400 mb-4">Fill details to register. OTP will be sent to your mobile.</p>
+
+                {error && (
+                  <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                    {error}
+                  </div>
+                )}
+
+                <form onSubmit={handleSendRegistrationOTP} className="space-y-3">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Full name
+                    <input
+                      type="text"
+                      autoComplete="name"
+                      required
+                      maxLength={100}
+                      value={regName}
+                      onChange={(e) => setRegName(e.target.value)}
+                      placeholder="Your full name"
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                    />
+                  </label>
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Gmail address
+                    <input
+                      type="email"
+                      autoComplete="email"
+                      inputMode="email"
+                      required
+                      maxLength={254}
+                      value={regEmail}
+                      onChange={(e) => setRegEmail(e.target.value)}
+                      placeholder="you@gmail.com"
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                    />
+                  </label>
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Mobile number
+                    <input
+                      type="tel"
+                      autoComplete="tel-national"
+                      inputMode="numeric"
+                      required
+                      value={regPhone}
+                      onChange={(e) => setRegPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
+                      placeholder="10-digit mobile number"
+                      maxLength={10}
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                    />
+                  </label>
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Password
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      required
+                      minLength={8}
+                      maxLength={72}
+                      value={regPassword}
+                      onChange={(e) => setRegPassword(e.target.value)}
+                      placeholder="At least 8 characters"
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                    />
+                  </label>
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Confirm password
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      required
+                      minLength={8}
+                      maxLength={72}
+                      value={regConfirmPassword}
+                      onChange={(e) => setRegConfirmPassword(e.target.value)}
+                      placeholder="Enter your password again"
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                    />
+                  </label>
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    We’ll send a verification code to your mobile number. Your email is used for account details.
+                  </p>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="w-full rounded-xl bg-[#173b32] py-3.5 text-sm font-bold text-white transition-colors hover:bg-[#102a24] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {loading ? 'Sending SMS code…' : 'Send SMS code'}
+                  </button>
+                </form>
+
+                <div className="mt-4 text-center text-[10px] text-slate-400">
+                  Already have an account?{' '}
+                  <button
+                    onClick={() => {
+                      setError('');
+                      openUserAuth('login');
+                    }}
+                    className="font-bold text-[#0B3C5D] hover:underline"
+                  >
+                    Sign In
+                  </button>
+                </div>
+              </>
+            ) : regStep === 'otp' ? (
+              // REGISTER - Step 2: Verify mobile number
+              <>
+                <div className="mb-1 flex items-center gap-2">
+                  <span className="text-2xl">🔐</span>
+                  <h3 className="text-lg font-black text-white">Verify your mobile number</h3>
+                </div>
+                <p className="text-[11px] text-slate-400 mb-4">
+                  Enter the 6-digit SMS code sent to the mobile ending in <strong>{regPhone.slice(-4)}</strong>.
+                </p>
+
+                {error && (
+                  <div className="bg-red-50 border border-red-200 text-red-600 text-xs font-medium px-4 py-2 rounded-xl mb-4">
+                    {error}
+                  </div>
+                )}
+
+                <form onSubmit={handleVerifyRegistrationOTP} className="space-y-4">
+                  <label className="block text-xs font-semibold text-white">
+                    SMS verification code
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    required
+                    maxLength={6}
+                    value={regSmsOtp}
+                    onChange={(e) => setRegSmsOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="6-digit SMS code"
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-center text-base font-bold tracking-[0.3em] text-slate-900 focus:border-[#173b32] focus:outline-none focus:ring-4 focus:ring-[#173b32]/10"
+                  />
+                  </label>
+
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">
+                      {regTimer > 0 ? `Resend in ${regTimer}s` : "Didn't receive OTP?"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleResendRegistrationOTP}
+                      disabled={regResendDisabled || loading}
+                      className="font-bold text-[#0B3C5D] hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Resend OTP
+                    </button>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading || regSmsOtp.length !== 6}
+                    className="w-full bg-green-600 text-white font-bold py-3 rounded-xl text-sm hover:bg-green-700 disabled:opacity-50"
+                  >
+                    {loading ? '⏳ Verifying...' : '✅ Verify & Register'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRegStep('form');
+                      setError('');
+                    }}
+                    className="w-full text-center text-[10px] text-slate-400 hover:text-[#0B3C5D] transition"
+                  >
+                    ← Back to Registration
+                  </button>
+                </form>
+              </>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {/* FORGOT PASSWORD MODAL */}
+      <ForgotPasswordModal
+        isOpen={isForgotPasswordOpen}
+        onClose={() => {
+          setIsForgotPasswordOpen(false);
+          setIsAuthModalOpen(true);
+          setUserAuthMode('login');
+        }}
+        onBackToLogin={() => {
+          setIsForgotPasswordOpen(false);
+          setIsAuthModalOpen(true);
+          setUserAuthMode('login');
+        }}
+      />
+
+            {/* 🆕 ORDER OTP MODAL */}
+      <OrderOTPModal
+        isOpen={isOrderOTPModalOpen}
+        phone={pendingOrderData?.orderData?.delivery?.phone}
+        isGuest={pendingOrderData?.isGuest}
+        onClose={() => {
+          setIsOrderOTPModalOpen(false);
+          setPendingOrderData(null);
+        }}
+        onVerified={handleVerifyOrderOTP}
+      />
+
+      {/* ADMIN AUTH MODAL */}
+      {showAdminAuth && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-sm"
+          onClick={() => {
+            setShowAdminAuth(false);
+            setAdminAuthMode('login');
+          }}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-sm w-full p-6 border border-slate-100 shadow-2xl relative"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => {
+                setShowAdminAuth(false);
+                setAdminAuthMode('login');
+              }}
+              className="absolute top-4 right-4 text-slate-400 hover:text-black font-bold text-lg"
+            >
+              ✕
+            </button>
+
+            <div className="flex items-center gap-3 mb-1">
+              <span className="text-2xl">👑</span>
+              <h3 className="text-lg font-black text-[#0B3C5D]">
+                Admin Login
+              </h3>
+            </div>
+            <p className="mb-4 text-[11px] text-slate-600">
+              Enter your admin credentials to access the admin panel
+            </p>
+
+            <form onSubmit={handleAdminLogin} className="space-y-3.5">
+              <div>
+                <label className="mb-1 block text-[10px] font-bold uppercase text-slate-700">Username</label>
+                <input
+                  type="text"
+                  value="admin"
+                  readOnly
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs text-slate-900 transition placeholder:text-slate-400 focus:border-[#0B3C5D] focus:bg-white focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] font-bold uppercase text-slate-700">Password</label>
+                <input
+                  type="password"
+                  required
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs text-slate-900 transition placeholder:text-slate-400 focus:border-[#0B3C5D] focus:bg-white focus:outline-none"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full bg-[#0B3C5D] text-white font-bold py-3 rounded-xl text-xs uppercase tracking-wider hover:bg-[#07263b] transition disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {loading ? '⏳ Processing...' : '🔑 Login'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* FULL-PAGE CART */}
+      {isCartOpen && (
+        <div
+          className="fixed inset-0 z-[110] flex overflow-y-auto bg-[#f7f5ef]"
+          onClick={closeCart}
+          role="dialog"
+          aria-modal="true"
+          aria-label={t('Cart')}
+        >
+          <div
+            className="velqra-cart-panel mx-auto flex h-full w-full flex-col bg-[#f7f5ef] p-4 text-slate-900 sm:p-6 lg:p-8"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-5 flex items-center justify-between border-b border-[#e3e0d8] pb-4">
+              <h2 className="relative top-1 text-2xl font-black text-[#2e473b]">{t('Your Cart')}</h2>
+              <button type="button" onClick={closeCart} aria-label={t('Continue Shopping')} className="text-gray-400 hover:text-black font-bold text-lg">
+                ✕
+              </button>
+            </div>
+
+            <div className="grid min-h-0 flex-1 grid-cols-1 gap-5 overflow-y-auto lg:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.8fr)] lg:grid-rows-[minmax(0,1fr)] lg:gap-8 lg:overflow-hidden">
+              <section className="flex min-h-[240px] min-w-0 flex-col lg:overflow-y-auto lg:pr-2">
+                {cartLoading ? (
+                  <div className="flex-1 flex flex-col items-center justify-center">
+                    <div className="mb-4 h-10 w-10 animate-spin rounded-full border-2 border-[#173b32]/15 border-t-[#173b32]" />
+                    <p className="text-sm font-medium text-slate-500">Loading your saved cart…</p>
+                  </div>
+                ) : cart.length === 0 ? (
+                  <div className="flex-1 flex flex-col items-center justify-center">
+                    <div className="text-6xl mb-4">🛍️</div>
+                    <p className="text-slate-400 text-sm font-medium">{t('Cart is empty')}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3 pb-2 pr-1 sm:pr-2">
+                    {cart.map(item => (
+                      <div key={getCartItemKey(item)} className="flex items-center justify-between gap-3 rounded-2xl border border-[#e9e6de] bg-white p-3 shadow-sm transition hover:shadow-md sm:gap-5 sm:p-4">
+                        <div className="flex min-w-0 flex-1 items-center gap-3 sm:gap-4">
+                          <img src={getProductDisplayImage(item)} alt={item.name} className="h-14 w-14 rounded-xl border border-slate-200 object-cover sm:h-16 sm:w-16" loading="lazy" />
+                          <div className="flex-1 min-w-0">
+                            <h4 className="truncate text-sm font-bold text-slate-900 sm:text-base">{item.name}</h4>
+                            {item.selectedAttributes && Object.keys(item.selectedAttributes).length > 0 && (
+                              <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-slate-500">
+                                {Object.entries(item.selectedAttributes).map(([key, value]) => (
+                                  value && <span key={key}>{key}: {value}</span>
+                                ))}
+                              </div>
+                            )}
+                            <p className="mt-1 text-xs text-slate-500">{formatPrice(item.price)} × {item.qty}</p>
+                          </div>
+                        </div>
+                        <div className="flex flex-shrink-0 items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                          <button type="button" onClick={() => updateQty(item, -1)} aria-label={`Decrease ${item.name} quantity`} className="grid h-9 w-9 place-items-center rounded-lg text-lg font-bold text-slate-500 transition hover:bg-white hover:text-[#FF5722]">−</button>
+                          <span className="w-7 text-center text-sm font-bold">{item.qty}</span>
+                          <button type="button" onClick={() => updateQty(item, 1)} aria-label={`Increase ${item.name} quantity`} className="grid h-9 w-9 place-items-center rounded-lg text-lg font-bold text-slate-500 transition hover:bg-white hover:text-[#0B3C5D]">+</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              {cart.length > 0 && (
+              <aside className="min-w-0 rounded-2xl border border-[#e3e0d8] bg-white p-4 shadow-[0_16px_50px_rgba(28,36,30,0.08)] sm:p-6 lg:min-h-0 lg:overflow-y-auto">
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#73786f]">{t('Order Summary')}</p>
+                  <span className="rounded-full bg-[#f2f1eb] px-3 py-1 text-xs font-bold text-[#2e473b]">
+                    {cart.length} {cart.length === 1 ? t('item') : t('items')}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-slate-500">{t('Subtotal')}</span>
+                  <span className="font-bold">{formatPrice(totalCartPrice)}</span>
+                </div>
+
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-slate-500">{t('Delivery')}</span>
+                  <span className="font-bold text-green-600">🎉 {t('Free')}</span>
+                </div>
+
+                {totalSavings > 0 && (
+                  <div className="flex justify-between items-center text-xs text-green-600">
+                    <span>💰 {t('Total Savings')}</span>
+                    <span className="font-bold">{formatPrice(totalSavings)}</span>
+                  </div>
+                )}
+
+                <div className="flex justify-between items-center font-bold text-sm pt-2 border-t border-slate-100">
+                  <span className="text-slate-600">{t('Grand Total:')}</span>
+                  <span className="text-[#0B3C5D] text-lg font-black">{formatPrice(grandTotal)}</span>
+                </div>
+                {currency !== 'INR' && (
+                  <p className="text-[10px] text-center text-amber-700">{t('Displayed prices use reference rates; checkout is charged in INR.')}</p>
+                )}
+                {checkoutOpen ? (
+                  <form onSubmit={handlePlaceOrder} className="space-y-3 pr-1">
+                    {/* Delivery Form */}
+                    <div className="rounded-xl border border-slate-200 p-3 bg-slate-50">
+                      <p className="text-[10px] font-bold uppercase text-slate-400 mb-2">{t('Delivery Details')}</p>
+                      <div className="grid gap-2">
+                        <input
+                          required
+                          value={deliveryForm.fullName}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, fullName: e.target.value }))}
+                          placeholder={t('Full Name *')}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <select
+                          required
+                          value={selectedCountry.isoCode}
+                          aria-label={t('Country')}
+                          onChange={(e) => {
+                            const nextCountry = COUNTRIES.find(country => country.isoCode === e.target.value);
+                            if (!nextCountry) return;
+                            setDeliveryForm(prev => ({
+                              ...prev,
+                              country: nextCountry.name,
+                              countryCode: nextCountry.isoCode,
+                              phone: '',
+                              state: '',
+                              city: '',
+                              district: '',
+                              pincode: ''
+                            }));
+                            if (nextCountry.isoCode !== 'IN') setPaymentMethod('online');
+                          }}
+                          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        >
+                          {COUNTRIES.map(country => (
+                            <option key={country.isoCode} value={country.isoCode}>{country.name}</option>
+                          ))}
+                        </select>
+                        <div className="flex overflow-hidden rounded-lg border border-slate-200 bg-white focus-within:border-[#0B3C5D]">
+                          <span className="flex items-center border-r border-slate-200 bg-slate-50 px-3 text-sm text-slate-600">
+                            +{getCountryCallingCode(selectedCountry)}
+                          </span>
+                          <input
+                            required
+                            type="tel"
+                            inputMode="tel"
+                            autoComplete="tel-national"
+                            value={deliveryForm.phone}
+                            onChange={(e) => setDeliveryForm(prev => ({
+                              ...prev,
+                              phone: e.target.value.replace(/\D/g, '').slice(0, Math.max(1, 15 - getCountryCallingCode(selectedCountry).length))
+                            }))}
+                            placeholder={registeredPhoneLoading ? t('Loading registered phone...') : t('Phone Number *')}
+                            className="min-w-0 flex-1 px-3 py-2 text-sm text-slate-900 focus:outline-none"
+                          />
+                        </div>
+                        <input
+                          required={paymentMethod === 'cod'}
+                          type="tel"
+                          value={deliveryForm.alternatePhone}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, alternatePhone: e.target.value.replace(/\D/g, '').slice(0, 10) }))}
+                          placeholder={`${t('Alternate Phone Number')}${paymentMethod === 'cod' ? ' *' : ''}`}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <input
+                          type="email"
+                          required={paymentMethod === 'online' && !currentUser?.email}
+                          value={deliveryForm.email || currentUser?.email || ''}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, email: e.target.value }))}
+                          placeholder={t('Email')}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <input
+                          required
+                          value={deliveryForm.pincode}
+                          onChange={(e) => setDeliveryForm(prev => ({
+                            ...prev,
+                            pincode: selectedCountry.isoCode === 'IN'
+                              ? e.target.value.replace(/\D/g, '').slice(0, 6)
+                              : e.target.value
+                          }))}
+                          placeholder={t('Pincode *')}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        {pincodeLookupStatus === 'loading' && (
+                          <p className="text-xs text-slate-500">{t('Finding city, district and state...')}</p>
+                        )}
+                        {pincodeLookupStatus === 'found' && (
+                          <p className="text-xs text-emerald-700">{t('Location details filled from PIN code.')}</p>
+                        )}
+                        {pincodeLookupStatus === 'not-found' && (
+                          <p className="text-xs text-amber-700">{t('PIN code not found. Please check it or enter location details manually.')}</p>
+                        )}
+                        {pincodeLookupStatus === 'error' && (
+                          <div className="flex items-center justify-between gap-2 text-xs text-red-600">
+                            <span>{t('Could not look up this PIN code.')}</span>
+                            <button
+                              type="button"
+                              onClick={() => setPincodeLookupAttempt(prev => prev + 1)}
+                              className="font-semibold underline"
+                            >
+                              {t('Try again')}
+                            </button>
+                          </div>
+                        )}
+                        {savedAddressLookupStatus === 'loading' && (
+                          <p className="text-xs text-slate-500">{t('Checking for a saved address...')}</p>
+                        )}
+                        {savedAddressLookupStatus === 'found' && (
+                          <p className="text-xs text-emerald-700">{t('Saved address filled from your previous order.')}</p>
+                        )}
+                        {savedAddressLookupStatus === 'error' && (
+                          <p className="text-xs text-red-600">{t('Could not check your saved address. Please try changing the PIN and retry.')}</p>
+                        )}
+                        {!sessionStorage.getItem('velqra_user_token') &&
+                          savedAddressLookupStatus !== 'loading' && deliveryPhone && (
+                            <p className="text-xs text-slate-500">{t('Sign in to securely autofill an address from a previous order.')}</p>
+                          )}
+                        <textarea
+                          required
+                          value={deliveryForm.address}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, address: e.target.value }))}
+                          placeholder={t('Complete Address *')}
+                          rows="2"
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm resize-none focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <input
+                          value={deliveryForm.landmark}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, landmark: e.target.value }))}
+                          placeholder={t('Landmark (optional)')}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <div className="grid grid-cols-2 gap-2">
+                          <input
+                            required
+                            value={deliveryForm.city}
+                            onChange={(e) => setDeliveryForm(prev => ({ ...prev, city: e.target.value }))}
+                            placeholder={t('City *')}
+                            className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                          />
+                          {countryStates.length > 0 ? (
+                            <select
+                              required
+                              value={deliveryForm.state}
+                              onChange={(e) => setDeliveryForm(prev => ({ ...prev, state: e.target.value }))}
+                              aria-label={t('State')}
+                              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:border-[#0B3C5D]"
+                            >
+                              <option value="">{t('Select State *')}</option>
+                              {deliveryForm.state && !countryStates.some(state => state.name === deliveryForm.state) && (
+                                <option value={deliveryForm.state}>{deliveryForm.state}</option>
+                              )}
+                              {countryStates.map(state => (
+                                <option key={state.isoCode} value={state.name}>{state.name}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              required
+                              value={deliveryForm.state}
+                              onChange={(e) => setDeliveryForm(prev => ({ ...prev, state: e.target.value }))}
+                              placeholder={t('State / Region *')}
+                              className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                            />
+                          )}
+                        </div>
+                        <input
+                          value={deliveryForm.district}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, district: e.target.value }))}
+                          placeholder={t('District')}
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                        <textarea
+                          value={deliveryForm.note}
+                          onChange={(e) => setDeliveryForm(prev => ({ ...prev, note: e.target.value }))}
+                          placeholder={t('Delivery note (optional)')}
+                          rows="2"
+                          className="w-full bg-white border border-slate-200 px-3 py-2 rounded-lg text-sm resize-none focus:outline-none focus:border-[#0B3C5D]"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Payment Method */}
+                    <div className="rounded-xl border border-slate-200 p-3 bg-slate-50">
+                      <p className="text-[10px] font-bold uppercase text-slate-400 mb-2">{t('Payment Method')}</p>
+                      <div className={`grid gap-2 ${selectedCountry.isoCode === 'IN' ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                        {selectedCountry.isoCode === 'IN' && (
+                          <button
+                            type="button"
+                            onClick={() => setPaymentMethod('cod')}
+                            className={`rounded-lg px-3 py-2 text-sm font-bold transition ${
+                              paymentMethod === 'cod'
+                                ? 'bg-[#0B3C5D] text-white shadow-md'
+                                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                            }`}
+                          >
+                            💵 {t('Cash on Delivery')}
+                          </button>
+                        )}
+
+                                                <button
+                          type="button"
+                          onClick={() => setPaymentMethod('online')}
+                          className={`rounded-lg px-3 py-2 text-sm font-bold transition ${
+                            paymentMethod === 'online'
+                              ? 'bg-blue-600 text-white shadow-md'
+                              : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                          }`}
+                        >
+                          <span className="flex items-center justify-center gap-1">
+                            <span>🔒</span> {t('Online Payment')}
+                          </span>
+                        </button>
+                      </div>
+
+                                            {selectedCountry.isoCode !== 'IN' && (
+                                              <p className="mt-2 text-xs text-amber-700">{t('Cash on Delivery is available only in India. International orders require online payment.')}</p>
+                                            )}
+
+                                            {paymentMethod === 'online' && (
+                        <div className="mt-3 rounded-xl border border-blue-200 bg-blue-50 p-4">
+                          <div className="flex items-start gap-2">
+                            <span className="text-lg">🔒</span>
+                            <div>
+                              <p className="text-xs font-bold text-blue-700">{t('Secure Payment via PayU')}</p>
+                              <p className="text-[10px] text-blue-600 mt-1 leading-relaxed">
+                                {t("After placing the order, you will be redirected to PayU's secure payment page. Pay using UPI, Credit/Debit Card, Net Banking, or Wallet.")}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      </div>
+
+                    <label className="flex items-start gap-2 text-xs text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={marketingConsent}
+                        onChange={(e) => setMarketingConsent(e.target.checked)}
+                        className="mt-0.5 accent-[#0B3C5D]"
+                      />
+                      <span>
+                        {t('I agree to share my contact details and order data with Meta for advertising measurement. This is optional and does not affect checkout.')}
+                      </span>
+                    </label>
+
+                    <div className="flex flex-col gap-2">
+                      {orderSubmitError && (
+                        <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700">
+                          {orderSubmitError}
+                        </p>
+                      )}
+                                            <button
+                        type="submit"
+                        disabled={placingOrder}
+                        className={`w-full font-bold py-3 rounded-xl text-sm transition flex items-center justify-center gap-2 ${
+                          paymentMethod === 'online'
+                            ? 'bg-blue-600 text-white hover:bg-blue-700'
+                            : 'bg-[#FF5722] text-white hover:bg-[#e64a19]'
+                        } ${placingOrder ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      >
+                        {placingOrder ? (
+                          <>
+                            <span className="animate-spin">⏳</span> Processing...
+                          </>
+                        ) : paymentMethod === 'online' ? (
+                          <>🔒 {t('Place Order & Pay')} {formatPrice(grandTotal)} via PayU (INR)</>
+                        ) : (
+                          <>📦 {t('Place Order')} ({formatPrice(grandTotal)})</>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={resetCheckout}
+                        className="w-full bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm hover:bg-slate-200 transition"
+                      >
+                        {t('Cancel')}
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <button
+                    onClick={() => setCheckoutOpen(true)}
+                    className="w-full bg-[#FF5722] text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 text-sm hover:bg-[#e64a19] transition shadow-md"
+                  >
+                    ✅ {t('Proceed to Checkout')}
+                  </button>
+                )}
+              </aside>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FOOTER */}
+      {!isUserAuthPage && !isCartOpen && (
+      <footer className="border-t border-neutral-800 bg-neutral-950 py-12 px-6 mt-20">
+        <div className="max-w-6xl mx-auto grid grid-cols-1 gap-8 md:grid-cols-2 lg:grid-cols-5">
+          <div>
+            <Link to="/" aria-label="VELQRA home" className="mb-3 flex items-center gap-2">
+              <img src={velqraLogo} alt="" className="header-brand-image" />
+              <span className="font-serif text-xl font-bold tracking-[0.08em] text-[#173b32]">
+                VELQRA<sup className="ml-0.5 text-[8px] font-normal text-[#d4af37]">™</sup>
+              </span>
+            </Link>
+            <p className="text-xs text-neutral-400 leading-relaxed">Premium International Skin Science. Formulated with pure botanical actives for radiant, healthy skin.</p>
+          </div>
+          <div>
+            <h5 className="text-xs font-bold text-neutral-300 uppercase mb-3">LEGAL & POLICIES</h5>
+            <ul className="space-y-2 text-xs text-neutral-400">
+              {[
+                ['Shipping Policy', '/shipping-policy'],
+                ['Privacy Policy', '/privacy-policy'],
+                ['Terms & Conditions', '/terms-policy'],
+                ['Returns & Refund Policy', '/return-refund-policy'],
+                ['Contact Policy', '/contact-policy'],
+                ['About Us', '/about']
+              ].map(([label, path]) => (
+                <li key={path}>
+                  <Link to={path} className="hover:text-amber-400">{label}</Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <h5 className="text-xs font-bold text-neutral-300 uppercase mb-3">SUPPORT</h5>
+            <a href="mailto:officialvelqra@gmail.com" className="break-all text-xs text-neutral-400 hover:text-amber-400">
+              officialvelqra@gmail.com
+            </a>
+            <a href="tel:+919050054177" className="mt-2 block text-xs text-neutral-400 hover:text-amber-400">
+              +91 90500 54177
+            </a>
+            <Link to="/orders" className="velqra-footer-track-order mt-4 inline-flex items-center justify-center rounded-full px-4 py-2 text-xs font-bold uppercase tracking-wide transition focus:outline-none focus:ring-2 focus:ring-[#2e473b] focus:ring-offset-2">
+              {t('Track Order')}
+            </Link>
+            <div className="mt-4 border-t border-neutral-800 pt-4">
+              <h5 className="mb-2 text-xs font-bold uppercase text-neutral-300">WEBSITE DEVELOPMENT</h5>
+              <p className="mb-2 text-xs text-neutral-400">Need a website for your business?</p>
+              <a
+                href="mailto:gs8901346287@gmail.com?subject=Website%20Development%20Inquiry"
+                className="inline-flex rounded-lg bg-amber-400 px-3 py-2 text-xs font-bold text-neutral-950 transition hover:bg-amber-300"
+              >
+                Email the developer
+              </a>
+              <a
+                href="tel:+918901346287"
+                className="mt-2 block text-xs text-neutral-400 transition hover:text-amber-400"
+              >
+                +91 89013 46287
+              </a>
+            </div>
+          </div>
+          <div>
+            <h5 className="text-xs font-bold text-neutral-300 uppercase mb-3">LOCATION</h5>
+            <p className="mb-3 text-xs leading-relaxed text-neutral-400">
+              Near Priyanka Dhaba, Balaji Hospital, Ward No. 11, Ateli Mandi, Mahendragarh, Haryana
+            </p>
+            <iframe
+              title="VELQRA store location"
+              src="https://www.google.com/maps?q=28.1038478,76.2499368&z=19&output=embed"
+              className="h-36 w-full rounded-lg border border-neutral-800"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              allowFullScreen
+            />
+          </div>
+          <div>
+            <h5 className="text-xs font-bold text-neutral-300 uppercase mb-3">SOCIAL</h5>
+            <div className="flex items-center gap-3">
+              <a href="https://www.instagram.com/officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on Instagram" className="flex h-9 w-9 items-center justify-center rounded-full border border-neutral-700 text-neutral-300 transition hover:border-[#d4af37] hover:text-[#d4af37]">
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <rect x="3" y="3" width="18" height="18" rx="5" />
+                  <circle cx="12" cy="12" r="4" />
+                  <circle cx="17.2" cy="6.8" r="1.2" fill="currentColor" stroke="none" />
+                </svg>
+              </a>
+              <a href="https://www.facebook.com/officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on Facebook" className="flex h-9 w-9 items-center justify-center rounded-full border border-neutral-700 text-neutral-300 transition hover:border-[#d4af37] hover:text-[#d4af37]">
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
+                  <path d="M13.7 21v-8h2.7l.4-3h-3.1V8.1c0-.9.2-1.5 1.6-1.5h1.7V3.9c-.3 0-1.3-.1-2.5-.1-2.5 0-4.2 1.5-4.2 4.3V10H7.6v3h2.7v8h3.4z" />
+                </svg>
+              </a>
+              <a href="https://www.youtube.com/@officialvelqra" target="_blank" rel="noreferrer" aria-label="VELQRA on YouTube" className="flex h-9 w-9 items-center justify-center rounded-full border border-neutral-700 text-neutral-300 transition hover:border-[#d4af37] hover:text-[#d4af37]">
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
+                  <path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8zM9.6 15.6V8.4l6.2 3.6-6.2 3.6z" />
+                </svg>
+              </a>
+            </div>
+          </div>
+        </div>
+        <div className="max-w-6xl mx-auto border-t border-neutral-900 mt-8 pt-6 text-center text-[11px] text-neutral-600">
+            © {new Date().getFullYear()} VELQRA. All Rights Reserved.
+          </div>
+        </footer>
+      )}
+    </div>
+    </LocalizationContext.Provider>
+  );
+}

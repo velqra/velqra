@@ -1,0 +1,62 @@
+services:
+  - type: web
+    name: atelimarket-backend
+    env: node
+    rootDir: backend
+    buildCommand: npm ci
+    startCommand: npm start
+    runtime: node
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        value: https://atelimarket.shop
+      - key: BACKEND_URL
+        value: https://velqra-aeap.onrender.com
+      - key: PAYU_BASE_URL
+        value: https://secure.payu.in/_payment
+      - key: PAYU_SUCCESS_URL
+        value: https://atelimarket.shop/api/payment/payu/callback
+      - key: PAYU_FAILURE_URL
+        value: https://atelimarket.shop/api/payment/payu/callback
+      - key: OTPFLOW_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        value: noreply@atelimarket.shop
+      - key: SMS_TEST_MODE
+        value: "false"
+      - key: PAYU_MERCHANT_KEY
+        sync: false
+      - key: PAYU_SALT
+        sync: false
+      - key: META_PIXEL_ID
+        sync: false
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: META_GRAPH_API_VERSION
+        value: v22.0
+      - key: META_TEST_EVENT_CODE
+        sync: false
+  - type: web
+    name: atelimarket-frontend
+    env: node
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BACKEND_ORIGIN
+        value: https://velqra-aeap.onrender.com
